@@ -1,0 +1,12 @@
+[package]
+name = "spike_e1_rust"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Headless deterministic discrete-event networking engine for PacketLens Spike E1"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

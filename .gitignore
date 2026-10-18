@@ -1,0 +1,18 @@
+# Rust
+/target/
+**/target/
+# .NET
+**/bin/
+**/obj/
+# Node / future UI
+**/node_modules/
+**/dist/
+# System / IDE
+.vs/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+# Local traces and performance captures
+*.trace.json
+*.benchmark.tmp
