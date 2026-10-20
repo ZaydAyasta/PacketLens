@@ -39,3 +39,22 @@ mismo.
 La decisión añade una superficie de errores pequeña, necesaria para pruebas
 seguras y para una futura aplicación de escritorio. No añade UI, tiempo real,
 concurrencia, enrutamiento ni comportamiento de red fuera de E1.
+
+## Aplicacion C#
+
+El spike C# comunica los mismos errores con `SimulationException` y
+`SimulationErrorCode`, en lugar de `Result`. Los errores de tiempo, secuencia
+y epoca se detectan antes de aceptar el evento y no pueden producir wraparound
+silencioso.
+
+Los limites normativos del scheduler no son errores de comando. Al intentar
+superar `MAX_PENDING_QUEUE_SIZE`, el scheduler conserva los eventos ya
+aceptados, recuerda `QueueCapacityExceeded { pending_count: 100_001,
+limit: 100_000 }` y la siguiente operacion de avance devuelve
+`HaltedBySafetyGuard`. Si el siguiente evento haria que se procesen 1.001
+eventos consecutivos en el mismo tiempo virtual, no se extrae ese evento y la
+operacion devuelve `HaltedBySafetyGuard(ZeroDelayLoop { ... })`.
+
+Las pruebas de limites que no son alcanzables de forma razonable por los seis
+escenarios usan una sonda `internal` visible solo al ensamblado de pruebas C#.
+No forma parte de la API publica ni del comportamiento de red.

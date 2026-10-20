@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permite cargar la ventana de la vertical experimental.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

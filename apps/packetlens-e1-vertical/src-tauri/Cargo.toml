@@ -1,0 +1,16 @@
+[package]
+name = "packetlens-e1-vertical"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "packetlens_e1_vertical_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+spike_e1_rust = { path = "../../../spikes/spike_e1_rust" }

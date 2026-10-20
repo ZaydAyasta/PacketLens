@@ -9,7 +9,6 @@ Simulador de redes educativo, de escritorio y open source, independiente de Cisc
 
 ## Restricciones de E1
 - No crear todavía Tauri, Vue, MCP, backend, plugins, UI, generador de proyectos ni CI compleja.
-- No usar REA para inspeccionar software propietario sin autorización. No copiar código, nombres comerciales, imágenes o recursos de Cisco.
 - No mezclar los dos prototipos mediante un motor compartido. Deben ser implementaciones independientes del mismo comportamiento especificado.
 - Ambas implementaciones producen resultados observables comparables; su cantidad de eventos internos puede diferir.
 - No usar tiempo real ni aleatoriedad sin semilla dentro de la simulación.

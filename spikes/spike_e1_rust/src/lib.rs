@@ -6,6 +6,84 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 
+#[cfg(test)]
+mod test_allocation {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct TrackingAllocator;
+
+    static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static PEAK_LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_allocated(bytes: usize) {
+        let live = LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let mut observed_peak = PEAK_LIVE_BYTES.load(Ordering::Relaxed);
+        while live > observed_peak {
+            match PEAK_LIVE_BYTES.compare_exchange_weak(
+                observed_peak,
+                live,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed_peak = current,
+            }
+        }
+    }
+
+    fn record_deallocated(bytes: usize) {
+        LIVE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    unsafe impl GlobalAlloc for TrackingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                record_allocated(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                record_allocated(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            record_deallocated(layout.size());
+            unsafe { System.dealloc(pointer, layout) };
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let reallocated = unsafe { System.realloc(pointer, layout, new_size) };
+            if !reallocated.is_null() {
+                if new_size >= layout.size() {
+                    record_allocated(new_size - layout.size());
+                } else {
+                    record_deallocated(layout.size() - new_size);
+                }
+            }
+            reallocated
+        }
+    }
+
+    pub fn live_bytes() -> usize {
+        LIVE_BYTES.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: test_allocation::TrackingAllocator = test_allocation::TrackingAllocator;
+
+/// Contrato de lectura para consumidores de presentaciÃ³n. No forma parte del
+/// dominio E1 ni del reporte canÃ³nico definido por ADR-0002.
+pub mod presentation;
+
 pub const LINK_PROPAGATION_DELAY_NS: u64 = 1_000;
 pub const DEVICE_PROCESSING_DELAY_NS: u64 = 100;
 pub const ARP_REQUEST_TIMEOUT_NS: u64 = 1_000_000_000;
@@ -557,6 +635,9 @@ pub struct Engine {
     links: BTreeMap<LinkRef, Link>,
     links_by_instance: BTreeMap<u64, LinkRef>,
     scheduler: BinaryHeap<ScheduledEvent>,
+    // Exact count for the predicate previously evaluated by scanning `scheduler`.
+    // Passive ARP/CAM expiry timers are deliberately excluded.
+    active_scheduled_events: usize,
     next_event_sequence: u64,
     next_link_instance: u64,
     next_epoch: u64,
@@ -575,6 +656,7 @@ impl Engine {
             links: BTreeMap::new(),
             links_by_instance: BTreeMap::new(),
             scheduler: BinaryHeap::new(),
+            active_scheduled_events: 0,
             next_event_sequence: 0,
             next_link_instance: 0,
             next_epoch: 0,
@@ -1007,6 +1089,7 @@ impl Engine {
                 },
             ));
         }
+        let is_active = self.event_is_active(&event);
         self.next_event_sequence = self
             .next_event_sequence
             .checked_add(1)
@@ -1016,6 +1099,9 @@ impl Engine {
             sequence: self.next_event_sequence,
             event,
         });
+        if is_active {
+            self.active_scheduled_events += 1;
+        }
         Ok(())
     }
 
@@ -1033,14 +1119,31 @@ impl Engine {
     }
 
     fn has_active_work(&self) -> bool {
-        self.scheduler.iter().any(|event| match &event.event {
+        self.active_scheduled_events > 0
+    }
+
+    fn event_is_active(&self, event: &InternalEvent) -> bool {
+        match event {
             InternalEvent::TransmitFrame { .. } | InternalEvent::FrameArrived { .. } => true,
-            InternalEvent::ArpResolveRetryTimer { node, target_ip, attempt, resolution_epoch } => {
+            InternalEvent::ArpResolveRetryTimer {
+                node,
+                target_ip,
+                attempt,
+                resolution_epoch,
+            } => {
                 matches!(self.devices.get(node), Some(Device::Host(host))
                     if host.resolutions.get(target_ip).is_some_and(|active| active.epoch == *resolution_epoch && active.attempt == *attempt))
             }
-            InternalEvent::ArpEntryExpireTimer { .. } | InternalEvent::MacEntryExpireTimer { .. } => false,
-        })
+            InternalEvent::ArpEntryExpireTimer { .. }
+            | InternalEvent::MacEntryExpireTimer { .. } => false,
+        }
+    }
+
+    fn remove_active_scheduled_event(&mut self) {
+        self.active_scheduled_events = self
+            .active_scheduled_events
+            .checked_sub(1)
+            .expect("active scheduled event count must match the scheduler");
     }
 
     fn process_one(&mut self) -> Result<(), EngineError> {
@@ -1066,6 +1169,9 @@ impl Engine {
             return Err(EngineError::TimeOverflow);
         }
         self.now = VirtualTime(scheduled.at);
+        if self.event_is_active(&scheduled.event) {
+            self.remove_active_scheduled_event();
+        }
         self.handle_event(scheduled.event)?;
         if self.last_event_at == Some(self.now.0) {
             self.events_at_same_time += 1;
@@ -1405,15 +1511,20 @@ impl Engine {
                 )
             }
             ArpOperation::Reply => {
-                let pending = {
+                let (pending, resolution_was_active) = {
                     let Some(Device::Host(host)) = self.devices.get_mut(&endpoint.device) else {
                         return Err(EngineError::InvalidHostConfiguration(endpoint.device));
                     };
-                    host.resolutions.remove(&arp.sender_ip);
-                    host.pending_arp_queue
-                        .remove(&arp.sender_ip)
-                        .unwrap_or_default()
+                    (
+                        host.pending_arp_queue
+                            .remove(&arp.sender_ip)
+                            .unwrap_or_default(),
+                        host.resolutions.remove(&arp.sender_ip).is_some(),
+                    )
                 };
+                if resolution_was_active {
+                    self.remove_active_scheduled_event();
+                }
                 let transmit_at = self
                     .now
                     .0
@@ -2016,6 +2127,8 @@ fn dropped_pdu_text(pdu: &DroppedPdu) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
 
     const PC1: MacAddress = MacAddress([0, 0, 0, 0, 0, 1]);
     const PC2: MacAddress = MacAddress([0, 0, 0, 0, 0, 2]);
@@ -2079,6 +2192,151 @@ mod tests {
         engine
     }
 
+    #[derive(Clone, Copy)]
+    struct SchedulerBenchmarkCase {
+        name: &'static str,
+        active_frames: usize,
+        passive_timers: usize,
+    }
+
+    fn benchmark_frame() -> EthernetFrame {
+        EthernetFrame {
+            src_mac: PC1,
+            dst_mac: MacAddress::BROADCAST,
+            payload: EthernetPayload::Arp(ArpPacket {
+                operation: ArpOperation::Request,
+                sender_mac: PC1,
+                sender_ip: IP1,
+                target_mac: MacAddress::ZERO,
+                target_ip: IP2,
+            }),
+        }
+    }
+
+    fn engine_with_benchmark_workload(case: SchedulerBenchmarkCase) -> (Engine, usize) {
+        let mut engine = base_engine();
+        let live_before_scheduling = test_allocation::live_bytes();
+
+        for index in 0..case.passive_timers {
+            engine
+                .schedule(
+                    (index as u64) + 1,
+                    InternalEvent::MacEntryExpireTimer {
+                        node: dev("absent"),
+                        mac: PC1,
+                        entry_epoch: index as u64,
+                    },
+                )
+                .unwrap();
+        }
+
+        let active_start = (case.passive_timers as u64) + 1;
+        for index in 0..case.active_frames {
+            engine
+                .schedule(
+                    active_start + (index as u64 * 10_000),
+                    InternalEvent::TransmitFrame {
+                        from: ep("pc1", "eth0"),
+                        frame: benchmark_frame(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let queue_live_bytes = test_allocation::live_bytes() - live_before_scheduling;
+        (engine, queue_live_bytes)
+    }
+
+    fn run_scheduler_benchmark_case(case: SchedulerBenchmarkCase) -> (Duration, usize, usize) {
+        let (mut engine, queue_live_bytes) = engine_with_benchmark_workload(case);
+        let max_steps = case
+            .passive_timers
+            .saturating_add(case.active_frames.saturating_mul(32))
+            .saturating_add(100);
+        let started = Instant::now();
+        let report = engine.run_until_quiescent(max_steps).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(report.outcome, ExecutionOutcome::Quiescent);
+        assert!(report.processed_events >= case.passive_timers + case.active_frames);
+        black_box(engine);
+        (elapsed, queue_live_bytes, report.processed_events)
+    }
+
+    fn assert_active_work_index_matches_scan(engine: &Engine) {
+        let scanned_count = engine
+            .scheduler
+            .iter()
+            .filter(|scheduled| engine.event_is_active(&scheduled.event))
+            .count();
+        assert_eq!(engine.active_scheduled_events, scanned_count);
+        assert_eq!(engine.has_active_work(), scanned_count > 0);
+    }
+
+    #[test]
+    #[ignore = "manual reproducible release benchmark; it reports timings instead of asserting them"]
+    fn benchmark_run_until_quiescent_scheduler_scaling() {
+        const REPEATS: usize = 7;
+        let cases = [
+            SchedulerBenchmarkCase {
+                name: "active=1 passive=0",
+                active_frames: 1,
+                passive_timers: 0,
+            },
+            SchedulerBenchmarkCase {
+                name: "active=1 passive=512",
+                active_frames: 1,
+                passive_timers: 512,
+            },
+            SchedulerBenchmarkCase {
+                name: "active=1 passive=2048",
+                active_frames: 1,
+                passive_timers: 2_048,
+            },
+            SchedulerBenchmarkCase {
+                name: "active=1 passive=8192",
+                active_frames: 1,
+                passive_timers: 8_192,
+            },
+            SchedulerBenchmarkCase {
+                name: "active=64 passive=0",
+                active_frames: 64,
+                passive_timers: 0,
+            },
+            SchedulerBenchmarkCase {
+                name: "active=64 passive=8192",
+                active_frames: 64,
+                passive_timers: 8_192,
+            },
+        ];
+
+        println!(
+            "scheduler benchmark: repeats={REPEATS}; scheduled_event_bytes={}",
+            std::mem::size_of::<ScheduledEvent>()
+        );
+        for case in cases {
+            let mut elapsed_samples = Vec::with_capacity(REPEATS);
+            let mut queue_live_bytes = 0;
+            let mut processed_events = 0;
+            for _ in 0..REPEATS {
+                let (elapsed, measured_queue_live_bytes, processed) =
+                    run_scheduler_benchmark_case(case);
+                elapsed_samples.push(elapsed);
+                queue_live_bytes = measured_queue_live_bytes;
+                processed_events = processed;
+            }
+            elapsed_samples.sort_unstable();
+            let median = elapsed_samples[REPEATS / 2];
+            println!(
+                "{}; median_ns={}; queue_live_bytes={}; processed_events={}",
+                case.name,
+                median.as_nanos(),
+                queue_live_bytes,
+                processed_events
+            );
+        }
+    }
+
     fn completed_rtt(snapshot: &TraceBufferSnapshot, sequence: u16) -> Option<u64> {
         snapshot
             .records
@@ -2106,6 +2364,192 @@ mod tests {
     }
 
     #[test]
+    fn a1_external_send_ping_transmits_initial_arp_at_zero_ns() {
+        let mut engine = base_engine();
+
+        engine.send_ping(dev("pc1"), IP2, 1, 1).unwrap();
+        engine.advance_until(VirtualTime(0), 10).unwrap();
+
+        let snapshot = engine.get_trace_snapshot();
+        assert!(snapshot.records.iter().any(|record| matches!(
+            &record.event,
+            ObservableEvent::ArpPacketQueued {
+                at_device,
+                target_ip,
+                ..
+            } if record.at == VirtualTime(0) && *at_device == dev("pc1") && *target_ip == IP2
+        )));
+        assert!(snapshot.records.iter().any(|record| matches!(
+            &record.event,
+            ObservableEvent::FrameTransmitted {
+                link: transmitted_link,
+                from,
+                to,
+                arrives_at,
+                frame: EthernetFrame {
+                    payload: EthernetPayload::Arp(ArpPacket {
+                        operation: ArpOperation::Request,
+                        ..
+                    }),
+                    ..
+                },
+            } if record.at == VirtualTime(0)
+                && *transmitted_link == link("link1")
+                && *from == ep("pc1", "eth0")
+                && *to == ep("sw1", "port1")
+                && *arrives_at == VirtualTime(1_000)
+        )));
+    }
+
+    #[test]
+    fn a1_deferred_transmit_does_not_use_an_admin_down_egress_interface() {
+        let mut engine = base_engine();
+        engine.send_ping(dev("pc1"), IP2, 1, 1).unwrap();
+        engine.advance_until(VirtualTime(1_000), 100).unwrap();
+
+        engine
+            .set_interface_admin_state(ep("sw1", "port2"), false)
+            .unwrap();
+        engine.advance_until(VirtualTime(2_100), 100).unwrap();
+
+        assert!(
+            !engine
+                .get_trace_snapshot()
+                .records
+                .iter()
+                .any(|record| matches!(
+                    &record.event,
+                    ObservableEvent::FrameTransmitted { from, .. }
+                        if record.at == VirtualTime(1_100) && *from == ep("sw1", "port2")
+                ))
+        );
+        assert!(
+            !engine
+                .get_trace_snapshot()
+                .records
+                .iter()
+                .any(|record| matches!(
+                    &record.event,
+                    ObservableEvent::FrameDelivered { at_endpoint, .. }
+                        if record.at == VirtualTime(2_100) && *at_endpoint == ep("pc2", "eth0")
+                ))
+        );
+        assert_eq!(
+            engine
+                .get_trace_snapshot()
+                .records
+                .iter()
+                .filter(|record| matches!(
+                    &record.event,
+                    ObservableEvent::PacketDropped {
+                        at_device,
+                        at_interface: Some(interface),
+                        pdu: DroppedPdu::Ethernet(_),
+                        reason: DropReason::EgressInterfaceDown,
+                    } if record.at == VirtualTime(1_100)
+                        && *at_device == dev("sw1")
+                        && *interface == iface("port2")
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a1_deferred_transmit_records_unavailable_current_egress_link() {
+        let mut engine = base_engine();
+        engine.send_ping(dev("pc1"), IP2, 1, 1).unwrap();
+        engine.advance_until(VirtualTime(1_000), 100).unwrap();
+
+        engine.disconnect_link(&link("link2")).unwrap();
+        engine.advance_until(VirtualTime(2_100), 100).unwrap();
+
+        let snapshot = engine.get_trace_snapshot();
+        assert!(!snapshot.records.iter().any(|record| matches!(
+            &record.event,
+            ObservableEvent::FrameTransmitted { from, .. }
+                if record.at == VirtualTime(1_100) && *from == ep("sw1", "port2")
+        )));
+        assert!(!snapshot.records.iter().any(|record| matches!(
+            &record.event,
+            ObservableEvent::FrameDelivered { at_endpoint, .. }
+                if record.at == VirtualTime(2_100) && *at_endpoint == ep("pc2", "eth0")
+        )));
+        assert_eq!(
+            snapshot
+                .records
+                .iter()
+                .filter(|record| matches!(
+                    &record.event,
+                    ObservableEvent::PacketDropped {
+                        at_device,
+                        at_interface: Some(interface),
+                        pdu: DroppedPdu::Ethernet(_),
+                        reason: DropReason::EgressLinkUnavailable,
+                    } if record.at == VirtualTime(1_100)
+                        && *at_device == dev("sw1")
+                        && *interface == iface("port2")
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a1_deferred_transmit_rechecks_the_current_reconnected_link() {
+        let mut engine = base_engine();
+        engine.send_ping(dev("pc1"), IP2, 1, 1).unwrap();
+        engine.advance_until(VirtualTime(1_000), 100).unwrap();
+
+        engine.disconnect_link(&link("link2")).unwrap();
+        engine
+            .connect_link(link("link2-new"), ep("pc2", "eth0"), ep("sw1", "port2"))
+            .unwrap();
+        engine.advance_until(VirtualTime(2_100), 100).unwrap();
+
+        let snapshot = engine.get_trace_snapshot();
+        assert!(!snapshot.records.iter().any(|record| matches!(
+            &record.event,
+            ObservableEvent::FrameTransmitted { link: transmitted_link, .. }
+                if record.at == VirtualTime(1_100) && *transmitted_link == link("link2")
+        )));
+        assert!(!snapshot.records.iter().any(|record| matches!(
+            &record.event,
+            ObservableEvent::PacketDropped {
+                at_device,
+                at_interface: Some(interface),
+                ..
+            } if record.at == VirtualTime(1_100)
+                && *at_device == dev("sw1")
+                && *interface == iface("port2")
+        )));
+        assert!(snapshot.records.iter().any(|record| matches!(
+            &record.event,
+            ObservableEvent::FrameTransmitted {
+                link: transmitted_link,
+                from,
+                to,
+                arrives_at,
+                ..
+            } if record.at == VirtualTime(1_100)
+                && *transmitted_link == link("link2-new")
+                && *from == ep("sw1", "port2")
+                && *to == ep("pc2", "eth0")
+                && *arrives_at == VirtualTime(2_100)
+        )));
+        assert!(snapshot.records.iter().any(|record| matches!(
+            &record.event,
+            ObservableEvent::FrameDelivered {
+                link: delivered_link,
+                at_endpoint,
+                ..
+            } if record.at == VirtualTime(2_100)
+                && *delivered_link == link("link2-new")
+                && *at_endpoint == ep("pc2", "eth0")
+        )));
+    }
+
+    #[test]
     fn e1_s2_cold_and_warm_ping_have_normative_rtts_and_obsolete_timer_is_quiescent() {
         let mut engine = base_engine();
         engine.send_ping(dev("pc1"), IP2, 1, 1).unwrap();
@@ -2120,6 +2564,66 @@ mod tests {
         assert_eq!(warm.current_time, VirtualTime(14_300));
         assert_eq!(completed_rtt(&engine.get_trace_snapshot(), 2), Some(4_300));
         assert!(!engine.get_trace_snapshot().records.iter().any(|r| matches!(&r.event, ObservableEvent::FrameDelivered { at_endpoint, .. } if at_endpoint.device == dev("pc3") && r.at.0 >= 10_000)));
+    }
+
+    #[test]
+    fn active_work_index_ignores_passive_and_obsolete_timers() {
+        let mut engine = base_engine();
+        for index in 0..32 {
+            engine
+                .schedule(
+                    (index as u64) + 1,
+                    InternalEvent::MacEntryExpireTimer {
+                        node: dev("absent"),
+                        mac: PC1,
+                        entry_epoch: index as u64,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(engine.active_scheduled_events, 0);
+
+        engine.send_ping(dev("pc1"), IP2, 1, 1).unwrap();
+        assert!(engine.active_scheduled_events > 0);
+
+        let report = engine.run_until_quiescent(200).unwrap();
+
+        assert_eq!(report.outcome, ExecutionOutcome::Quiescent);
+        assert_eq!(report.current_time, VirtualTime(8_700));
+        assert_eq!(engine.active_scheduled_events, 0);
+        assert!(!engine.scheduler.is_empty());
+        assert!(!engine.has_active_work());
+    }
+
+    #[test]
+    fn active_work_index_matches_the_scan_during_arp_resolution() {
+        let mut engine = base_engine();
+        for index in 0..32 {
+            engine
+                .schedule(
+                    (index as u64) + 1,
+                    InternalEvent::MacEntryExpireTimer {
+                        node: dev("absent"),
+                        mac: PC1,
+                        entry_epoch: index as u64,
+                    },
+                )
+                .unwrap();
+        }
+        engine.send_ping(dev("pc1"), IP2, 1, 1).unwrap();
+
+        for _ in 0..200 {
+            assert_active_work_index_matches_scan(&engine);
+            if !engine.has_active_work() {
+                break;
+            }
+            engine.process_one().unwrap();
+        }
+
+        assert_active_work_index_matches_scan(&engine);
+        assert!(!engine.has_active_work());
+        assert_eq!(engine.now(), VirtualTime(8_700));
+        assert!(!engine.scheduler.is_empty());
     }
 
     #[test]
@@ -2375,13 +2879,13 @@ mod tests {
                 )
                 .unwrap();
         }
+        assert_eq!(capacity.active_scheduled_events, 0);
         assert_eq!(
             capacity.schedule(
                 1,
-                InternalEvent::MacEntryExpireTimer {
-                    node: dev("absent"),
-                    mac: PC1,
-                    entry_epoch: 1,
+                InternalEvent::TransmitFrame {
+                    from: ep("absent", "eth0"),
+                    frame: benchmark_frame(),
                 },
             ),
             Err(EngineError::SafetyGuard(
@@ -2391,6 +2895,7 @@ mod tests {
                 }
             ))
         );
+        assert_eq!(capacity.active_scheduled_events, 0);
     }
 
     #[test]

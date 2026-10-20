@@ -1,0 +1,8 @@
+[package]
+name = "packetlens_e1_evaluation_rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+spike_e1_rust = { path = "../../../spikes/spike_e1_rust" }
