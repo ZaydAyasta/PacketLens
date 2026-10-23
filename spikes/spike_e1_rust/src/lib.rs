@@ -84,8 +84,13 @@ static TEST_ALLOCATOR: test_allocation::TrackingAllocator = test_allocation::Tra
 /// dominio E1 ni del reporte canÃ³nico definido por ADR-0002.
 pub mod presentation;
 pub mod ipv4;
+mod icmp;
+#[cfg(test)]
+mod icmp_router_tests;
+pub use icmp::{IcmpErrorPacket, OriginalDatagramSummary};
 pub mod routing;
 pub mod router_engine;
+mod router_protocol;
 
 pub const LINK_PROPAGATION_DELAY_NS: u64 = 1_000;
 pub const DEVICE_PROCESSING_DELAY_NS: u64 = 100;
@@ -189,6 +194,7 @@ pub struct IcmpPacket {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ipv4Payload {
     Icmp(IcmpPacket),
+    IcmpError(IcmpErrorPacket),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,6 +234,8 @@ pub enum DropReason {
     ArpResolutionFailed,
     DestinationMacMismatch,
     Ipv4DestinationMismatch,
+    NoRouteToHost,
+    TtlExpiredInTransit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,6 +313,8 @@ pub struct TraceRecord {
     pub seq: TraceSeq,
     pub at: VirtualTime,
     pub event: ObservableEvent,
+    /// Domain scope for E2 router observations; not part of presentation/v1.
+    pub observation_interface: Option<InterfaceName>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,6 +348,15 @@ impl TraceBuffer {
     }
 
     fn emit(&mut self, at: VirtualTime, event: ObservableEvent) -> Result<(), EngineError> {
+        self.emit_scoped(at, event, None)
+    }
+
+    fn emit_scoped(
+        &mut self,
+        at: VirtualTime,
+        event: ObservableEvent,
+        scope: Option<InterfaceName>,
+    ) -> Result<(), EngineError> {
         self.total_emitted_ever = self
             .total_emitted_ever
             .checked_add(1)
@@ -353,6 +372,7 @@ impl TraceBuffer {
             seq: TraceSeq(self.total_emitted_ever),
             at,
             event,
+            observation_interface: scope,
         });
         Ok(())
     }
@@ -398,6 +418,8 @@ pub struct ExecutionReport {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
+    /// The successful routing increment does not yet generate ICMP errors.
+    RouterIcmpErrorPathPending,
     EngineBusy,
     Ipv4Configuration(ipv4::ConfigurationError),
     DuplicateId(String),
@@ -606,6 +628,17 @@ enum InternalEvent {
         node: DeviceRef,
         mac: MacAddress,
         entry_epoch: u64,
+    },
+    RouterArpExpireTimer {
+        endpoint: EndpointRef,
+        ip: Ipv4Address,
+        entry_epoch: u64,
+    },
+    RouterArpRetryTimer {
+        endpoint: EndpointRef,
+        target_ip: Ipv4Address,
+        attempt: u8,
+        resolution_epoch: u64,
     },
 }
 
@@ -964,6 +997,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         self.validate_ipv4_topology()?;
         let (endpoint, _, source_ip) = self.host_interface_for(&source, target_ip)?;
+        let next_hop = self.host_next_hop(&source, target_ip)?;
         let key = PingKey {
             source: source.clone(),
             target_ip,
@@ -992,7 +1026,7 @@ impl Engine {
         self.host_send_ipv4(
             source,
             endpoint.interface,
-            target_ip,
+            next_hop,
             packet,
             Some(key),
             self.now.0,
@@ -1142,6 +1176,14 @@ impl Engine {
                 Err(EngineError::UnknownDevice(host.clone()))
             };
         };
+        if let Some((name, config)) = &node.ipv4_configuration {
+            let endpoint = EndpointRef { device: host.clone(), interface: name.clone() };
+            let port = self.interface(&endpoint)?;
+            if port.admin_up {
+                return Ok((endpoint,port.mac.ok_or_else(|| EngineError::InvalidHostConfiguration(host.clone()))?,config.interface().address()));
+            }
+            return Err(EngineError::NoRoute { source: host.clone(), target_ip: peer_ip });
+        }
         for (name, iface) in &node.interfaces {
             if !iface.admin_up {
                 continue;
@@ -1227,7 +1269,10 @@ impl Engine {
                 matches!(self.devices.get(node), Some(Device::Host(host))
                     if host.resolutions.get(target_ip).is_some_and(|active| active.epoch == *resolution_epoch && active.attempt == *attempt))
             }
+            InternalEvent::RouterArpRetryTimer { endpoint,target_ip,attempt,resolution_epoch } =>
+                self.router_resolution_active(endpoint,*target_ip,*attempt,*resolution_epoch),
             InternalEvent::ArpEntryExpireTimer { .. }
+            | InternalEvent::RouterArpExpireTimer { .. }
             | InternalEvent::MacEntryExpireTimer { .. } => false,
         }
     }
@@ -1299,6 +1344,8 @@ impl Engine {
                 mac,
                 entry_epoch,
             } => self.expire_mac(node, mac, entry_epoch),
+            InternalEvent::RouterArpExpireTimer { endpoint,ip,entry_epoch } => self.expire_router_arp(endpoint,ip,entry_epoch),
+            InternalEvent::RouterArpRetryTimer { endpoint,target_ip,attempt,resolution_epoch } => self.retry_router_arp(endpoint,target_ip,attempt,resolution_epoch),
         }
     }
 
@@ -1533,8 +1580,7 @@ impl Engine {
         match self.devices.get(&dst.device) {
             Some(Device::Host(_)) => self.host_received_frame(dst, frame),
             Some(Device::Switch(_)) => self.switch_received_frame(dst, frame),
-            // Router packet processing belongs to the next increment.
-            Some(Device::Router(_)) => Ok(()),
+            Some(Device::Router(_)) => self.router_received_frame(dst, frame),
             None => Err(EngineError::UnknownDevice(dst.device)),
         }
     }
@@ -1650,7 +1696,10 @@ impl Engine {
         if packet.dst_ip != own_ip {
             return self.drop_at(endpoint, frame, DropReason::Ipv4DestinationMismatch);
         }
-        let Ipv4Payload::Icmp(icmp) = packet.payload.clone();
+        let Ipv4Payload::Icmp(icmp) = packet.payload.clone() else {
+            // Error receipt does not close Ping until the lifecycle increment.
+            return Ok(());
+        };
         match icmp.kind {
             IcmpKind::EchoRequest => {
                 let reply = Ipv4Packet {
@@ -1669,9 +1718,9 @@ impl Engine {
                     .checked_add(DEVICE_PROCESSING_DELAY_NS)
                     .ok_or(EngineError::TimeOverflow)?;
                 self.host_send_ipv4(
-                    endpoint.device,
+                    endpoint.device.clone(),
                     endpoint.interface,
-                    packet.src_ip,
+                    self.host_next_hop(&endpoint.device, packet.src_ip)?,
                     reply,
                     None,
                     at,

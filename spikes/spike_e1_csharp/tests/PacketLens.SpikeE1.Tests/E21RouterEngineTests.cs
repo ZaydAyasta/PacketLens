@@ -109,7 +109,7 @@ public sealed class E21RouterEngineTests
     }
 
     [Fact]
-    public void RouterIsNotAnL2SwitchOrEchoServiceYet()
+    public void RouterUsesScopedArpWithoutL2SwitchLearning()
     {
         var e=Engine(); e.CreateHost("h",["p"]);
         e.ConfigureInterface(Endpoint.Of("h","p"),MacAddress.Parse("02:00:00:00:00:10"),Ip("192.168.1.10"),24,true);
@@ -117,6 +117,7 @@ public sealed class E21RouterEngineTests
         e.SendPing("h",Ip("192.168.1.1"),1,1);
         Assert.Equal(ExecutionOutcome.Quiescent,e.RunUntilQuiescent(100).Outcome);
         Assert.Equal(0,e.MacTableEntryCount("r")); Assert.Null(e.ArpEntry("r",Ip("192.168.1.10")));
+        Assert.Equal(MacAddress.Parse("02:00:00:00:00:10"),e.RouterArpEntry(Endpoint.Of("r","a"),Ip("192.168.1.10")));
     }
 
     [Fact]

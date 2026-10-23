@@ -33,9 +33,17 @@ impl RouterPortConfig {
 pub(super) struct Router {
     pub(super) interfaces: BTreeMap<InterfaceName, Interface>,
     configuration: RouterConfiguration,
+    pub(super) arp: BTreeMap<InterfaceName,crate::router_protocol::RouterArpState>,
 }
 
 impl Engine {
+    pub(super) fn host_next_hop(&self, host: &DeviceRef, destination: Ipv4Address) -> Result<Ipv4Address,EngineError> {
+        match self.host_ipv4_config(host) {
+            Some(settings) if !settings.interface().network().contains(destination) => settings.default_gateway()
+                .ok_or_else(|| EngineError::NoRoute { source: host.clone(),target_ip: destination }),
+            _ => Ok(destination),
+        }
+    }
     pub fn set_interface_ipv4_mode(
         &mut self,
         endpoint: EndpointRef,
@@ -129,7 +137,7 @@ impl Engine {
         let configuration =
             RouterConfiguration::new(ports.iter().map(|p| (p.name.clone(), p.ipv4)).collect())
                 .map_err(EngineError::Ipv4Configuration)?;
-        let interfaces = ports
+        let interfaces: BTreeMap<_,_> = ports
             .into_iter()
             .map(|p| {
                 (
@@ -147,6 +155,7 @@ impl Engine {
         self.devices.insert(
             device,
             Device::Router(Router {
+                arp: interfaces.keys().map(|name| (name.clone(),Default::default())).collect(),
                 interfaces,
                 configuration,
             }),

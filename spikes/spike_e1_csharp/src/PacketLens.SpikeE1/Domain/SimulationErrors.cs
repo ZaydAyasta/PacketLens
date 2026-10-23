@@ -8,7 +8,8 @@ public enum SimulationErrorCode
     SequenceOverflow,
     EpochOverflow,
     LinkInstanceOverflow,
-    EngineBusy
+    EngineBusy,
+    RouterIcmpErrorPathPending
 }
 
 public sealed class SimulationException(SimulationErrorCode code) : Exception(code.ToString())

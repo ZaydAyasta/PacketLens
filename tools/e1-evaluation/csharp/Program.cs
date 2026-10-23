@@ -14,6 +14,11 @@ internal static class Program
     private static void Main(string[] args)
     {
         var command = args.ElementAtOrDefault(0);
+        if (command == "e21-s1")
+        {
+            E21S1Probe.Run();
+            return;
+        }
         if (command == "e21-router")
         {
             E21RouterProbe.Run();

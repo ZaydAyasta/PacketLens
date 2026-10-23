@@ -279,7 +279,7 @@ fn router_and_route_mutations_are_busy_atomic_but_admin_and_links_are_allowed() 
 }
 
 #[test]
-fn registered_router_is_not_an_l2_switch_or_an_echo_service_yet() {
+fn registered_router_uses_scoped_arp_without_l2_switch_learning() {
     let mut e = engine();
     e.create_host("h".into(), vec!["p".into()]).unwrap();
     e.configure_interface(
@@ -302,6 +302,7 @@ fn registered_router_is_not_an_l2_switch_or_an_echo_service_yet() {
     );
     assert_eq!(e.mac_table_len(&"r".into()), 0);
     assert_eq!(e.arp_entry(&"r".into(), ip(192, 168, 1, 10)), None);
+    assert_eq!(e.router_arp_entry(&EndpointRef::new("r","a"),ip(192,168,1,10)).unwrap(),Some(MacAddress([2,0,0,0,0,10])));
 }
 
 #[test]

@@ -3,6 +3,8 @@ namespace PacketLens.SpikeE1.Domain;
 public abstract record TraceEvent(ulong AtNs)
 {
     public ulong TraceSequence { get; internal set; }
+    // Domain-only E2 scope; existing presentation/v1 mappings remain unchanged.
+    public string? ObservationInterface { get; internal init; }
 }
 
 public sealed record FrameTransmitted(ulong AtNs, string Link, Endpoint From, Endpoint To, ulong ArrivesAtNs, EthernetFrame Frame) : TraceEvent(AtNs);
@@ -20,7 +22,10 @@ public enum DropReason
     EgressInterfaceDown,
     EgressLinkUnavailable,
     ArpResolutionFailed,
-    ArpTargetIpMismatch
+    ArpTargetIpMismatch,
+    DestinationMacMismatch,
+    NoRouteToHost,
+    TtlExpiredInTransit
 }
 
 public enum PingFailureReason { ArpTimeout }

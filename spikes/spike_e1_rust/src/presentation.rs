@@ -922,6 +922,7 @@ fn ethernet_arp_payload(packet: &ArpPacket) -> PresentationEthernetPayload {
 
 fn ipv4_payload(packet: &Ipv4Packet) -> PresentationIpv4Payload {
     match &packet.payload {
+        Ipv4Payload::IcmpError(_) => unreachable!("E1-only exporter cannot project E2 ICMP errors into presentation/v1"),
         Ipv4Payload::Icmp(icmp) => PresentationIpv4Payload::Icmp {
             icmp_kind: match icmp.kind {
                 IcmpKind::EchoRequest => "echo_request",
@@ -992,6 +993,7 @@ fn table_delta_from(update: &TableUpdateDetail, at_device: &DeviceRef) -> Presen
 
 fn drop_reason_code(reason: &DropReason) -> &'static str {
     match reason {
+        DropReason::NoRouteToHost | DropReason::TtlExpiredInTransit => unreachable!("E2 drop cannot be projected by the E1-only exporter"),
         DropReason::LinkDisconnectedInFlight => "link_disconnected_in_flight",
         DropReason::IngressInterfaceDown => "ingress_interface_down",
         DropReason::EgressInterfaceDown => "egress_interface_down",

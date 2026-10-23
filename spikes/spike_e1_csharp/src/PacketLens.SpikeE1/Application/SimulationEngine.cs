@@ -121,6 +121,8 @@ public sealed partial class SimulationEngine
     {
         ValidateIpv4Topology();
         var (_, port) = FindHostPortFor(source, targetIp);
+        if (_devices[source].ConfiguredIpv4 is { } configured && !configured.Settings.Interface.Network.Contains(targetIp) && configured.Settings.DefaultGateway is null)
+            throw new InvalidOperationException("No host gateway for remote destination.");
         _pingStarts.Add(new PingKey(source, targetIp, identifier, sequence), _currentTimeNs);
         var packet = new Ipv4Packet(port.Ipv4!.Address, targetIp, 64, new IcmpPacket(IcmpKind.EchoRequest, identifier, sequence));
         SendIpv4(source, targetIp, packet, _currentTimeNs);
@@ -195,6 +197,12 @@ public sealed partial class SimulationEngine
 
     internal void ScheduleNoOperationForTesting(ulong atNs) => Schedule(atNs, new NoOperationEvent());
     internal void SetNextSequenceForTesting(ulong value) => _nextSequence = value;
+    internal void InjectFrameForTesting(Endpoint destination,EthernetFrame frame,ulong at)
+    {
+        if (at < _currentTimeNs) throw new SimulationException(SimulationErrorCode.TargetTimeInPast);
+        var instance=FindInterface(destination).LinkInstance ?? throw new ArgumentException("Injection requires a connected interface.",nameof(destination));
+        Schedule(at,new FrameArrivalEvent(instance,destination,frame));
+    }
 
     private void CreateDevice(string device, IReadOnlyList<string> portNames, bool isHost)
     {
@@ -205,6 +213,8 @@ public sealed partial class SimulationEngine
 
     private void SendIpv4(string source, Ipv4Address nextHop, Ipv4Packet packet, ulong transmitAtNs)
     {
+        if (_devices[source].ConfiguredIpv4 is { } configured && !configured.Settings.Interface.Network.Contains(nextHop))
+            nextHop = configured.Settings.DefaultGateway ?? throw new InvalidOperationException("No host gateway for remote destination.");
         var (endpoint, port) = FindHostPortFor(source, nextHop);
         var host = _devices[source];
         if (host.ArpCache.TryGetValue(nextHop, out var entry))
@@ -296,6 +306,8 @@ public sealed partial class SimulationEngine
             case ArpRetryEvent retry: HandleArpRetry(retry); break;
             case ArpExpireEvent expiry: ExpireArp(expiry); break;
             case MacExpireEvent expiry: ExpireMac(expiry); break;
+            case RouterArpExpireEvent expiry: ExpireRouterArp(expiry); break;
+            case RouterArpRetryEvent retry: RetryRouterArp(retry); break;
             case NoOperationEvent: break;
             default: throw new InvalidOperationException("Unknown simulation event.");
         }
@@ -343,8 +355,8 @@ public sealed partial class SimulationEngine
 
         _trace.Add(new FrameDelivered(_currentTimeNs, linkName, arrival.Destination, arrival.Frame));
         if (_devices[arrival.Destination.Device].IsHost) ReceiveAtHost(arrival.Destination, arrival.Frame);
-        // Router packet processing is deliberately not enabled in this increment.
-        else if (_devices[arrival.Destination.Device].Router is null) ReceiveAtSwitch(arrival.Destination, arrival.Frame);
+        else if (_devices[arrival.Destination.Device].Router is not null) ReceiveAtRouter(arrival.Destination,arrival.Frame);
+        else ReceiveAtSwitch(arrival.Destination, arrival.Frame);
     }
 
     private void ReceiveAtHost(Endpoint endpoint, EthernetFrame frame)
@@ -460,9 +472,9 @@ public sealed partial class SimulationEngine
         foreach (var packet in packets)
         {
             _trace.Add(new PacketDropped(_currentTimeNs, retry.Node, null, null, packet, DropReason.ArpResolutionFailed));
-            if (packet.Payload.Kind == IcmpKind.EchoRequest && _pingStarts.Remove(new PingKey(retry.Node, retry.TargetIp, packet.Payload.Identifier, packet.Payload.Sequence)))
+            if (packet.Payload.Kind == IcmpKind.EchoRequest && _pingStarts.Remove(new PingKey(retry.Node, packet.DestinationIp, packet.Payload.Identifier, packet.Payload.Sequence)))
             {
-                _trace.Add(new PingFailed(_currentTimeNs, retry.Node, retry.TargetIp, packet.Payload.Identifier, packet.Payload.Sequence, PingFailureReason.ArpTimeout));
+                _trace.Add(new PingFailed(_currentTimeNs, retry.Node, packet.DestinationIp, packet.Payload.Identifier, packet.Payload.Sequence, PingFailureReason.ArpTimeout));
             }
         }
     }
@@ -488,6 +500,12 @@ public sealed partial class SimulationEngine
     private (Endpoint Endpoint, InterfaceState Port) FindHostPortFor(string device, Ipv4Address targetIp)
     {
         if (!_devices.TryGetValue(device, out var node) || !node.IsHost) throw new ArgumentException("The source must be an existing host.", nameof(device));
+        if (node.ConfiguredIpv4 is { } configured)
+        {
+            var selected = node.Interfaces[configured.Interface];
+            if (!selected.AdminUp) throw new InvalidOperationException("The selected IPv4 interface is down.");
+            return (Endpoint.Of(device,configured.Interface),selected);
+        }
         foreach (var pair in node.Interfaces)
         {
             if (pair.Value.AdminUp && pair.Value.Ipv4 is { } address && address.Address.IsInSameSubnet(targetIp, address.PrefixLength)) return (new Endpoint(device, pair.Key), pair.Value);
@@ -526,6 +544,7 @@ public sealed partial class SimulationEngine
     private bool HasActiveWork() => _events.UnorderedItems.Any(item => item.Element switch
     {
         TransmitFrameEvent or FrameArrivalEvent => true,
+        RouterArpRetryEvent retry => RouterResolutionActive(retry),
         ArpRetryEvent retry => _devices.TryGetValue(retry.Node, out var host)
             && host.Resolutions.TryGetValue(retry.TargetIp, out var resolution)
             && resolution.Epoch == retry.ResolutionEpoch
@@ -535,6 +554,9 @@ public sealed partial class SimulationEngine
 
     private sealed class DeviceState(bool isHost, IReadOnlyList<string> names)
     {
+        public Dictionary<(string Interface, Ipv4Address Ip), ArpCacheEntry> RouterArpCache { get; } = [];
+        public Dictionary<(string Interface, Ipv4Address Ip), List<RouterPendingPacket>> RouterPending { get; } = [];
+        public Dictionary<(string Interface, Ipv4Address Ip), ArpResolution> RouterResolutions { get; } = [];
         public RouterConfiguration? Router { get; set; }
         public (string Interface, HostIpv4Settings Settings)? ConfiguredIpv4 { get; set; }
         public bool IsHost { get; } = isHost;
