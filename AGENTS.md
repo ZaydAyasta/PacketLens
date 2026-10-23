@@ -1,7 +1,7 @@
 # Instrucciones de desarrollo para agentes
 
 ## Proyecto
-Simulador de redes educativo, de escritorio y open source, independiente de Cisco Packet Tracer. Primera tarea: validar un motor headless de eventos discretos mediante Spike E1 en Rust y C#.
+Simulador de redes, de escritorio y open source, independiente de Cisco Packet Tracer. Primera tarea: validar un motor headless de eventos discretos mediante Spike E1 en Rust y C#.
 
 ## Fuente de verdad
 - `docs/specs/SPEC-E1-v1.0.md`
