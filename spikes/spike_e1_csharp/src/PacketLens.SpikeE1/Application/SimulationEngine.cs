@@ -121,12 +121,13 @@ public sealed partial class SimulationEngine
     {
         ValidateIpv4Topology();
         var (_, port) = FindHostPortFor(source, targetIp);
-        if (_devices[source].ConfiguredIpv4 is { } configured && !configured.Settings.Interface.Network.Contains(targetIp) && configured.Settings.DefaultGateway is null)
-            throw new InvalidOperationException("No host gateway for remote destination.");
         _pingStarts.Add(new PingKey(source, targetIp, identifier, sequence), _currentTimeNs);
         var packet = new Ipv4Packet(port.Ipv4!.Address, targetIp, 64, new IcmpPacket(IcmpKind.EchoRequest, identifier, sequence));
         SendIpv4(source, targetIp, packet, _currentTimeNs);
     }
+
+    // Read-only friend-assembly probe; replying must not register a ping session.
+    internal int ActivePingCountForTesting(string host) => _pingStarts.Keys.Count(key => key.Source == host);
 
     public ExecutionReport AdvanceUntil(ulong targetTimeNs, int maxStepsGuard)
     {
@@ -214,7 +215,17 @@ public sealed partial class SimulationEngine
     private void SendIpv4(string source, Ipv4Address nextHop, Ipv4Packet packet, ulong transmitAtNs)
     {
         if (_devices[source].ConfiguredIpv4 is { } configured && !configured.Settings.Interface.Network.Contains(nextHop))
-            nextHop = configured.Settings.DefaultGateway ?? throw new InvalidOperationException("No host gateway for remote destination.");
+        {
+            if (configured.Settings.DefaultGateway is not { } gateway)
+            {
+                _trace.Add(new PacketDropped(_currentTimeNs,source,configured.Interface,null,packet,DropReason.NoRouteToHost));
+                if (packet.Payload is IcmpPacket { Kind:IcmpKind.EchoRequest } echo
+                    && _pingStarts.Remove(new PingKey(source,packet.DestinationIp,echo.Identifier,echo.Sequence)))
+                    _trace.Add(new PingFailed(_currentTimeNs,source,packet.DestinationIp,echo.Identifier,echo.Sequence,PingFailureReason.DestinationNetworkUnreachable));
+                return;
+            }
+            nextHop = gateway;
+        }
         var (endpoint, port) = FindHostPortFor(source, nextHop);
         var host = _devices[source];
         if (host.ArpCache.TryGetValue(nextHop, out var entry))

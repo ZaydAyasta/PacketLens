@@ -558,7 +558,7 @@ fn identical_neighbor_ip_on_two_interfaces_has_independent_arp_entries() {
 }
 
 #[test]
-fn unsupported_remote_command_without_gateway_does_not_leave_a_hidden_session() {
+fn remote_command_without_gateway_fails_normatively_without_hidden_session() {
     let mut e = Engine::with_default_trace_capacity();
     host(
         &mut e,
@@ -567,8 +567,9 @@ fn unsupported_remote_command_without_gateway_does_not_leave_a_hidden_session() 
         None,
         MacAddress([0, 0, 0, 0, 1, 1]),
     );
-    assert!(e.send_ping("h".into(), ip(10, 0, 0, 20), 1, 1).is_err());
-    assert!(e.get_trace_snapshot().records.is_empty());
+    e.send_ping("h".into(), ip(10, 0, 0, 20), 1, 1).unwrap();
+    assert_eq!(e.get_trace_snapshot().records.len(),2);
+    assert!(matches!(&e.get_trace_snapshot().records[1].event,ObservableEvent::PingFailed {reason:PingFailureReason::DestinationNetworkUnreachable,..}));
     e.configure_host_ipv4(
         EndpointRef::new("h", "eth0"),
         MacAddress([0, 0, 0, 0, 1, 1]),

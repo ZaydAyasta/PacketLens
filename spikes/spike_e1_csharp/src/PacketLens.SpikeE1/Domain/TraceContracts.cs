@@ -30,7 +30,7 @@ public enum DropReason
     InvalidIpv4Source
 }
 
-public enum PingFailureReason { ArpTimeout }
+public enum PingFailureReason { ArpTimeout, DestinationNetworkUnreachable }
 
 public sealed record PacketDropped(ulong AtNs, string Device, string? InterfaceName, EthernetFrame? EthernetFrame, Ipv4Packet? Ipv4Packet, DropReason Reason) : TraceEvent(AtNs);
 

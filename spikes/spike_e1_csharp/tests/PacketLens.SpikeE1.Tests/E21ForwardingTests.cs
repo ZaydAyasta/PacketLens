@@ -155,10 +155,11 @@ public sealed class E21ForwardingTests
     }
 
     [Fact]
-    public void UnsupportedRemoteCommandWithoutGatewayLeavesNoHiddenSession()
+    public void RemoteCommandWithoutGatewayFailsNormativelyWithoutHiddenSession()
     {
         var e=new SimulationEngine(); Host(e,"h","192.168.1.10",null,"00:00:00:00:01:01");
-        Assert.Throws<InvalidOperationException>(()=>e.SendPing("h",Ip("10.0.0.20"),1,1)); Assert.Empty(e.Trace.Records);
+        e.SendPing("h",Ip("10.0.0.20"),1,1); Assert.Equal(2,e.Trace.Records.Count);
+        Assert.Equal(PingFailureReason.DestinationNetworkUnreachable,Assert.IsType<PingFailed>(e.Trace.Records[1]).Reason);
         e.ConfigureHostIpv4(Endpoint.Of("h","eth0"),MacAddress.Parse("00:00:00:00:01:01"),new(new(Ip("192.168.1.10"),24),Ip("192.168.1.1")),true);
     }
 

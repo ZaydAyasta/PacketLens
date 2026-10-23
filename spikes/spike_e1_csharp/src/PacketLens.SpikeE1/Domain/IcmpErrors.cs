@@ -26,7 +26,7 @@ public sealed record DestinationNetworkUnreachableMessage(OriginalDatagramSummar
     public override IcmpKind Kind => IcmpKind.DestinationNetworkUnreachable;
     public override byte Type => 3;
 }
-// Accepted input PDU for suppression tests; router generation is a later increment.
+// Emitted on eligible router ARP exhaustion; also accepted as suppressed error input.
 public sealed record DestinationHostUnreachableMessage(OriginalDatagramSummary Original) : IcmpErrorMessage(Original)
 {
     public override IcmpKind Kind => IcmpKind.DestinationHostUnreachable;

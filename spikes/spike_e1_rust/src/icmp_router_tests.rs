@@ -614,6 +614,37 @@ pub(crate) fn observation_projection(e: &Engine, label: &str) -> Vec<String> {
                     DroppedPdu::Ipv4(p) => packet(&p),
                 }
             ),
+            ObservableEvent::PingFailed {
+                host,
+                target_ip,
+                identifier,
+                sequence,
+                reason,
+            } => format!(
+                "failed|{}|{}|{}|{}|{reason:?}",
+                host.0,
+                address(target_ip),
+                identifier,
+                sequence
+            ),
+            ObservableEvent::PingCompleted {
+                host,
+                target_ip,
+                identifier,
+                sequence,
+                rtt_ns,
+            } => format!(
+                "completed|{}|{}|{}|{}|{}",
+                host.0,
+                address(target_ip),
+                identifier,
+                sequence,
+                rtt_ns
+            ),
+            ObservableEvent::TableUpdated {
+                at_device,
+                update: TableUpdateDetail::ArpEntryExpired { ip },
+            } => format!("expired|{}|{}", at_device.0, address(ip)),
             other => panic!("unexpected observation in error-only probe: {other:?}"),
         };
         rows.push(format!(
@@ -690,22 +721,34 @@ fn icmp_cross_projection_is_deterministic() {
 }
 
 #[test]
-fn ordinary_router_arp_exhaustion_keeps_the_pending_diagnostic() {
+fn ordinary_router_arp_exhaustion_returns_host_unreachable() {
     let mut e = loop_return_fixture();
     e.set_interface_admin_state(EndpointRef::new("r2", "eth0"), false)
         .unwrap();
     assert_eq!(
-        e.run_until_quiescent(1000),
-        Err(EngineError::RouterIcmpErrorPathPending)
+        e.run_until_quiescent(1000).unwrap().outcome,
+        ExecutionOutcome::Quiescent
     );
-    assert!(errors(&e).is_empty());
-    assert!(!e.get_trace_snapshot().records.iter().any(|r| matches!(
-        &r.event,
-        ObservableEvent::PacketDropped {
-            reason: DropReason::ArpResolutionFailed,
-            ..
-        }
-    )));
+    let tx = errors(&e);
+    assert_eq!(tx.len(), 1);
+    assert!(matches!(
+        &tx[0].2.payload,
+        Ipv4Payload::IcmpError(IcmpErrorPacket::DestinationHostUnreachable { .. })
+    ));
+    assert_eq!(
+        e.get_trace_snapshot()
+            .records
+            .iter()
+            .filter(|r| matches!(
+                &r.event,
+                ObservableEvent::PacketDropped {
+                    reason: DropReason::ArpResolutionFailed,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
 }
 #[test]
 fn no_route_generates_network_unreachable() {

@@ -3,6 +3,8 @@ use crate::*;
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(test)]
+mod arp_failure_tests;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct RouterArpState {
@@ -14,8 +16,8 @@ pub(super) struct RouterArpState {
 #[derive(Clone, Debug)]
 struct RouterPending {
     packet: Ipv4Packet,
-    // Original reception retained for future ICMP suppression; not inferred causality.
-    _received: Option<(EndpointRef, EthernetFrame)>,
+    // Admitted reception retained through ARP for suppression, not inferred causality.
+    received: Option<(EndpointRef, EthernetFrame)>,
 }
 
 fn is_icmp_error(packet: &Ipv4Packet) -> bool {
@@ -288,9 +290,14 @@ impl Engine {
                     sequence: icmp.sequence,
                 }),
             };
-            let route = self
-                .lookup_router_route(&ingress.device, reply.dst_ip)?
-                .ok_or(EngineError::RouterIcmpErrorPathPending)?;
+            let Some(route) = self.lookup_router_route(&ingress.device, reply.dst_ip)? else {
+                return self.emit(ObservableEvent::PacketDropped {
+                    at_device: ingress.device,
+                    at_interface: Some(ingress.interface),
+                    pdu: DroppedPdu::Ipv4(reply),
+                    reason: DropReason::NoRouteToHost,
+                });
+            };
             let endpoint = EndpointRef {
                 device: ingress.device,
                 interface: route.egress_interface,
@@ -306,7 +313,7 @@ impl Engine {
                 next,
                 RouterPending {
                     packet: reply,
-                    _received: None,
+                    received: None,
                 },
                 at,
             );
@@ -333,7 +340,7 @@ impl Engine {
             next,
             RouterPending {
                 packet,
-                _received: Some((ingress, original)),
+                received: Some((ingress, original)),
             },
             at,
         )
@@ -351,6 +358,15 @@ impl Engine {
             pdu: DroppedPdu::Ipv4(packet.clone()),
             reason,
         })?;
+        self.router_emit_icmp_error(ingress, packet, reason)
+    }
+
+    fn router_emit_icmp_error(
+        &mut self,
+        ingress: EndpointRef,
+        packet: Ipv4Packet,
+        reason: DropReason,
+    ) -> Result<(), EngineError> {
         // The new error PDU may be forwarded, but never answered with another error.
         if is_icmp_error(&packet) {
             return Ok(());
@@ -373,6 +389,9 @@ impl Engine {
             DropReason::NoRouteToHost => {
                 IcmpErrorPacket::DestinationNetworkUnreachable { original: summary }
             }
+            DropReason::ArpResolutionFailed => {
+                IcmpErrorPacket::DestinationHostUnreachable { original: summary }
+            }
             _ => unreachable!("Only implemented router ICMP triggers enter here"),
         };
         let response = Ipv4Packet {
@@ -391,7 +410,7 @@ impl Engine {
             route.next_hop.unwrap_or(packet.src_ip),
             RouterPending {
                 packet: response,
-                _received: None,
+                received: None,
             },
             at,
         )
@@ -511,36 +530,34 @@ impl Engine {
                 },
             )
         } else {
-            // Discard errors, including legacy tags, without a secondary error.
-            // Ordinary originals and Host Unreachable remain pending for 05b.
+            // Retire the old epoch before an error can start a new resolution,
+            // including one using this same interface/neighbor key.
             let pending = self
                 .router_arp_mut(&endpoint)?
                 .pending
                 .remove(&target)
                 .unwrap_or_default();
-            let (errors, originals): (VecDeque<_>, VecDeque<_>) =
-                pending.into_iter().partition(|p| is_icmp_error(&p.packet));
-            let has_originals = !originals.is_empty();
-            if has_originals {
-                self.router_arp_mut(&endpoint)?
-                    .pending
-                    .insert(target, originals);
-            } else {
-                self.router_arp_mut(&endpoint)?.resolutions.remove(&target);
-            }
-            for error in errors {
+            self.router_arp_mut(&endpoint)?.resolutions.remove(&target);
+            for original in pending {
                 self.emit(ObservableEvent::PacketDropped {
                     at_device: endpoint.device.clone(),
                     at_interface: Some(endpoint.interface.clone()),
-                    pdu: DroppedPdu::Ipv4(error.packet),
+                    pdu: DroppedPdu::Ipv4(original.packet.clone()),
                     reason: DropReason::ArpResolutionFailed,
                 })?;
+                // Local Echo responses and our own errors do not originate a
+                // Ping or a secondary error. Forwarded packets retain admission context.
+                if let Some((ingress, received)) = original.received {
+                    if received.dst_mac.0[0] & 1 == 0 {
+                        self.router_emit_icmp_error(
+                            ingress,
+                            original.packet,
+                            DropReason::ArpResolutionFailed,
+                        )?;
+                    }
+                }
             }
-            if has_originals {
-                Err(EngineError::RouterIcmpErrorPathPending)
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
     }
 }

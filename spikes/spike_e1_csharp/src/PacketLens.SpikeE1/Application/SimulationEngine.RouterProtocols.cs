@@ -54,6 +54,14 @@ public sealed partial class SimulationEngine
         return _devices[endpoint.Device].RouterArpCache.TryGetValue((endpoint.InterfaceName,ip),out var entry) ? entry.Mac : null;
     }
 
+    // Read-only cleanup oracle for the friend test assembly; no simulation mutation.
+    internal (int Packets, int Resolutions) RouterArpWorkForTesting(string router)
+    {
+        _ = Router(router);
+        var owner=_devices[router];
+        return (owner.RouterPending.Values.Sum(packets=>packets.Count),owner.RouterResolutions.Count);
+    }
+
     internal void SeedRouterArpForTesting(Endpoint endpoint, Ipv4Address ip, MacAddress mac)
     {
         EnsureIpv4ConfigurationIdle();
@@ -85,7 +93,12 @@ public sealed partial class SimulationEngine
         {
             if (packet.Payload.Kind != IcmpKind.EchoRequest) return;
             var reply=new Ipv4Packet(packet.DestinationIp,packet.SourceIp,64,new IcmpPacket(IcmpKind.EchoReply,packet.Payload.Identifier,packet.Payload.Sequence));
-            var returnRoute=LookupRouterRoute(ingress.Device,reply.DestinationIp) ?? throw new SimulationException(SimulationErrorCode.RouterIcmpErrorPathPending);
+            var returnRoute=LookupRouterRoute(ingress.Device,reply.DestinationIp);
+            if (returnRoute is null)
+            {
+                _trace.Add(new PacketDropped(_currentTimeNs,ingress.Device,ingress.InterfaceName,null,reply,DropReason.NoRouteToHost));
+                return;
+            }
             QueueRouterIpv4(Endpoint.Of(ingress.Device,returnRoute.EgressInterface),returnRoute.NextHop ?? reply.DestinationIp,new(reply,null,null),AddTime(_currentTimeNs,DeviceProcessingDelayNs));
             return;
         }
@@ -107,6 +120,11 @@ public sealed partial class SimulationEngine
     private void RecordRouterFailure(Endpoint ingress,Ipv4Packet original,DropReason reason)
     {
         _trace.Add(new PacketDropped(_currentTimeNs,ingress.Device,ingress.InterfaceName,null,original,reason));
+        SendRouterIcmpError(ingress,original,reason);
+    }
+
+    private void SendRouterIcmpError(Endpoint ingress,Ipv4Packet original,DropReason reason)
+    {
         if (IsIcmpError(original)) return;
         var route=LookupRouterRoute(ingress.Device,original.SourceIp);
         if (route is null) return;
@@ -115,6 +133,7 @@ public sealed partial class SimulationEngine
         IcmpMessage error=reason switch {
             DropReason.NoRouteToHost=>new DestinationNetworkUnreachableMessage(summary),
             DropReason.TtlExpiredInTransit=>new TimeExceededMessage(summary),
+            DropReason.ArpResolutionFailed=>new DestinationHostUnreachableMessage(summary),
             _=>throw new InvalidOperationException("Not an implemented ICMP trigger.")
         };
         var response=new Ipv4Packet(FindInterface(endpoint).Ipv4!.Address,original.SourceIp,64,error);
@@ -150,16 +169,17 @@ public sealed partial class SimulationEngine
         if (timer.Attempt>=3)
         {
             var owner=_devices[timer.Endpoint.Device];var pendingKey=(timer.Endpoint.InterfaceName,timer.Target);
-            if (owner.RouterPending.TryGetValue(pendingKey,out var packets))
-            {
-                var errors=packets.FindAll(p=>IsIcmpError(p.Packet));
-                packets.RemoveAll(p=>IsIcmpError(p.Packet));
-                foreach (var error in errors)
-                    _trace.Add(new PacketDropped(_currentTimeNs,timer.Endpoint.Device,timer.Endpoint.InterfaceName,null,error.Packet,DropReason.ArpResolutionFailed));
-                if (packets.Count>0) throw new SimulationException(SimulationErrorCode.RouterIcmpErrorPathPending);
-                owner.RouterPending.Remove(pendingKey);
-            }
+            // Remove the old epoch first: a return error may need this same key.
             owner.RouterResolutions.Remove(pendingKey);
+            if (owner.RouterPending.Remove(pendingKey,out var packets))
+            {
+                foreach (var pending in packets)
+                {
+                    _trace.Add(new PacketDropped(_currentTimeNs,timer.Endpoint.Device,timer.Endpoint.InterfaceName,null,pending.Packet,DropReason.ArpResolutionFailed));
+                    if (pending.Ingress is { } ingress && pending.Received is { } received && (received.DestinationMac.A & 1)==0)
+                        SendRouterIcmpError(ingress,pending.Packet,DropReason.ArpResolutionFailed);
+                }
+            }
             return;
         }
         var at=AddTime(_currentTimeNs,ArpRequestTimeoutNs); var attempt=checked((byte)(timer.Attempt+1));

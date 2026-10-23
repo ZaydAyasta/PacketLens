@@ -158,6 +158,9 @@ public sealed class E21RouterIcmpTests(Xunit.Abstractions.ITestOutputHelper outp
                 ArpPacketQueued q=>$"queue|{q.Device}|{Address(q.TargetIp)}|{Packet(q.Packet)}",
                 TableUpdated {Update:ArpLearned a} t=>$"arp|{t.Device}|{Address(a.Ip)}|{MacText(a.Mac)}|{a.ExpiresAtNs}",
                 PacketDropped d=>$"drop|{d.Device}|{d.InterfaceName??"-"}|{d.Reason}|"+(d.EthernetFrame is { } f ? Frame(f):Packet(d.Ipv4Packet!)),
+                PingFailed p=>$"failed|{p.Host}|{Address(p.TargetIp)}|{p.Identifier}|{p.Sequence}|{p.Reason}",
+                PingCompleted p=>$"completed|{p.Host}|{Address(p.TargetIp)}|{p.Identifier}|{p.Sequence}|{p.RttNs}",
+                TableUpdated {Update:ArpEntryExpired a} t=>$"expired|{t.Device}|{Address(a.Ip)}",
                 _=>throw new InvalidOperationException("Unexpected non-error-path observation")};
             rows.Add($"ICMP4|{label}|{r.TraceSequence}|{r.AtNs}|{r.ObservationInterface??"-"}|{detail}");
         }return rows.ToArray();
@@ -190,12 +193,12 @@ public sealed class E21RouterIcmpTests(Xunit.Abstractions.ITestOutputHelper outp
         }
     }
     [Fact]
-    public void OrdinaryRouterArpExhaustionKeepsPendingDiagnostic()
+    public void OrdinaryRouterArpExhaustionReturnsHostUnreachable()
     {
         var e=LoopReturnFixture();e.SetInterfaceAdminState(Endpoint.Of("r2","eth0"),false);
-        Assert.Equal(SimulationErrorCode.RouterIcmpErrorPathPending,Assert.Throws<SimulationException>(()=>e.RunUntilQuiescent(1000)).Code);
-        Assert.DoesNotContain(e.Trace.Records.OfType<FrameTransmitted>(),t=>t.Frame.Payload is Ipv4Packet {Payload:IcmpErrorMessage});
-        Assert.DoesNotContain(e.Trace.Records.OfType<PacketDropped>(),d=>d.Reason==DropReason.ArpResolutionFailed);
+        Assert.Equal(ExecutionOutcome.Quiescent,e.RunUntilQuiescent(1000).Outcome);
+        Assert.Single(e.Trace.Records.OfType<FrameTransmitted>(),t=>t.Frame.Payload is Ipv4Packet {Payload:DestinationHostUnreachableMessage});
+        Assert.Single(e.Trace.Records.OfType<PacketDropped>(),d=>d.Reason==DropReason.ArpResolutionFailed);
     }
     [Theory]
     [InlineData(1,7,1,"198.51.100.1")]

@@ -1008,6 +1008,9 @@ fn drop_reason_code(reason: &DropReason) -> &'static str {
 fn ping_failure_code(reason: &PingFailureReason) -> &'static str {
     match reason {
         PingFailureReason::ArpTimeout => "arp_timeout",
+        PingFailureReason::DestinationNetworkUnreachable => {
+            unreachable!("E2 failure is not part of the E1 presentation/v1 exporter")
+        }
     }
 }
 

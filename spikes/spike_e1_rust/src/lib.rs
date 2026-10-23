@@ -243,6 +243,7 @@ pub enum DropReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PingFailureReason {
     ArpTimeout,
+    DestinationNetworkUnreachable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -420,7 +421,7 @@ pub struct ExecutionReport {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
-    /// Router failure path still outside the implemented increments.
+    /// Reserved legacy diagnostic; normative router failure paths no longer emit it.
     RouterIcmpErrorPathPending,
     EngineBusy,
     Ipv4Configuration(ipv4::ConfigurationError),
@@ -999,7 +1000,6 @@ impl Engine {
     ) -> Result<(), EngineError> {
         self.validate_ipv4_topology()?;
         let (endpoint, _, source_ip) = self.host_interface_for(&source, target_ip)?;
-        let next_hop = self.host_next_hop(&source, target_ip)?;
         let key = PingKey {
             source: source.clone(),
             target_ip,
@@ -1024,6 +1024,26 @@ impl Engine {
                 identifier,
                 sequence,
             }),
+        };
+        let next_hop = match self.host_next_hop(&source, target_ip) {
+            Ok(next) => next,
+            Err(EngineError::NoRoute { .. }) => {
+                self.pings.remove(&key);
+                self.emit(ObservableEvent::PacketDropped {
+                    at_device: source.clone(),
+                    at_interface: Some(endpoint.interface),
+                    pdu: DroppedPdu::Ipv4(packet),
+                    reason: DropReason::NoRouteToHost,
+                })?;
+                return self.emit(ObservableEvent::PingFailed {
+                    host: source,
+                    target_ip,
+                    identifier,
+                    sequence,
+                    reason: PingFailureReason::DestinationNetworkUnreachable,
+                });
+            }
+            Err(error) => return Err(error),
         };
         self.host_send_ipv4(
             source,
@@ -1719,10 +1739,22 @@ impl Engine {
                     .0
                     .checked_add(DEVICE_PROCESSING_DELAY_NS)
                     .ok_or(EngineError::TimeOverflow)?;
+                let next = match self.host_next_hop(&endpoint.device, packet.src_ip) {
+                    Ok(next) => next,
+                    Err(EngineError::NoRoute { .. }) => {
+                        return self.emit(ObservableEvent::PacketDropped {
+                            at_device: endpoint.device,
+                            at_interface: Some(endpoint.interface),
+                            pdu: DroppedPdu::Ipv4(reply),
+                            reason: DropReason::NoRouteToHost,
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
                 self.host_send_ipv4(
                     endpoint.device.clone(),
                     endpoint.interface,
-                    self.host_next_hop(&endpoint.device, packet.src_ip)?,
+                    next,
                     reply,
                     None,
                     at,

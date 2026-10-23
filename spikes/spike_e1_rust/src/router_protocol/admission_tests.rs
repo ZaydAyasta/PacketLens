@@ -431,7 +431,7 @@ fn post_arp_case(kind: u8, ttl: u8, fail: bool) -> Engine {
         .router_arp_mut(&EndpointRef::new("r1", "eth1"))
         .unwrap()
         .pending[&ip(203, 0, 113, 2)][0];
-    assert_eq!(pending._received, Some((ingress(), input)));
+    assert_eq!(pending.received, Some((ingress(), input)));
     let mut forwarded = p;
     forwarded.ttl -= 1;
     assert_eq!(pending.packet, forwarded);
