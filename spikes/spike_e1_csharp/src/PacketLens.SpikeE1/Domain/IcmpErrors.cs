@@ -14,7 +14,7 @@ public sealed record OriginalDatagramSummary(Ipv4Address SourceIp, Ipv4Address D
 public abstract record IcmpErrorMessage(OriginalDatagramSummary Original) : IcmpMessage
 {
     public abstract byte Type { get; }
-    public byte Code => 0;
+    public virtual byte Code => 0;
 }
 public sealed record TimeExceededMessage(OriginalDatagramSummary Original) : IcmpErrorMessage(Original)
 {
@@ -25,4 +25,11 @@ public sealed record DestinationNetworkUnreachableMessage(OriginalDatagramSummar
 {
     public override IcmpKind Kind => IcmpKind.DestinationNetworkUnreachable;
     public override byte Type => 3;
+}
+// Accepted input PDU for suppression tests; router generation is a later increment.
+public sealed record DestinationHostUnreachableMessage(OriginalDatagramSummary Original) : IcmpErrorMessage(Original)
+{
+    public override IcmpKind Kind => IcmpKind.DestinationHostUnreachable;
+    public override byte Type => 3;
+    public override byte Code => 1;
 }

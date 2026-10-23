@@ -492,7 +492,7 @@ fn time_exceeded_returns_across_router_with_intact_summary() {
     assert_eq!(e.now().0, 9900);
 }
 
-fn observation_projection(e: &Engine, label: &str) -> Vec<String> {
+pub(crate) fn observation_projection(e: &Engine, label: &str) -> Vec<String> {
     fn address(a: Ipv4Address) -> String {
         format!("{}.{}.{}.{}", a.0[0], a.0[1], a.0[2], a.0[3])
     }

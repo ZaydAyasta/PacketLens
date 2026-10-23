@@ -1,6 +1,9 @@
 //! E2 router protocol state, separate from configuration and presentation.
 use crate::*;
 
+#[cfg(test)]
+mod admission_tests;
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct RouterArpState {
     cache: BTreeMap<Ipv4Address, ArpEntry>,
@@ -13,6 +16,16 @@ struct RouterPending {
     packet: Ipv4Packet,
     // Original reception retained for future ICMP suppression; not inferred causality.
     _received: Option<(EndpointRef, EthernetFrame)>,
+}
+
+fn is_icmp_error(packet: &Ipv4Packet) -> bool {
+    match &packet.payload {
+        Ipv4Payload::IcmpError(_) => true,
+        Ipv4Payload::Icmp(message) => matches!(
+            message.kind,
+            IcmpKind::TimeExceeded | IcmpKind::DestinationHostUnreachable
+        ),
+    }
 }
 
 impl Engine {
@@ -38,7 +51,9 @@ impl Engine {
             .ipv4
             .ok_or_else(|| EngineError::InvalidHostConfiguration(endpoint.device.clone()))?
             .0;
-        if frame.dst_mac != mac && frame.dst_mac != MacAddress::BROADCAST {
+        let group_ipv4 =
+            frame.dst_mac.0[0] & 1 != 0 && matches!(frame.payload, EthernetPayload::Ipv4(_));
+        if frame.dst_mac != mac && frame.dst_mac != MacAddress::BROADCAST && !group_ipv4 {
             return self.drop_at(endpoint, frame, DropReason::DestinationMacMismatch);
         }
         let arp = match frame.payload.clone() {
@@ -228,12 +243,27 @@ impl Engine {
             })
         };
         if original.dst_mac.0[0] & 1 != 0
-            || !crate::ipv4::is_unicast(packet.src_ip)
-            || !crate::ipv4::is_unicast(packet.dst_ip)
-            || own_broadcast(packet.src_ip)
+            || (224..=239).contains(&packet.dst_ip.0[0])
+            || packet.dst_ip == Ipv4Address([255; 4])
             || own_broadcast(packet.dst_ip)
         {
-            return Err(EngineError::RouterIcmpErrorPathPending);
+            return self.emit(ObservableEvent::PacketDropped {
+                at_device: ingress.device,
+                at_interface: Some(ingress.interface),
+                pdu: DroppedPdu::Ipv4(packet),
+                reason: DropReason::UnsupportedIpDestination,
+            });
+        }
+        if matches!(packet.src_ip.0[0], 0 | 127 | 224..=239)
+            || packet.src_ip == Ipv4Address([255; 4])
+            || own_broadcast(packet.src_ip)
+        {
+            return self.emit(ObservableEvent::PacketDropped {
+                at_device: ingress.device,
+                at_interface: Some(ingress.interface),
+                pdu: DroppedPdu::Ipv4(packet),
+                reason: DropReason::InvalidIpv4Source,
+            });
         }
         // A locally delivered Request is not a transit packet. The Reply is newly originated.
         let local = self.devices.get(&ingress.device).is_some_and(|d| {
@@ -322,7 +352,7 @@ impl Engine {
             reason,
         })?;
         // The new error PDU may be forwarded, but never answered with another error.
-        if matches!(packet.payload, Ipv4Payload::IcmpError(_)) {
+        if is_icmp_error(&packet) {
             return Ok(());
         }
         let Some(route) = self.lookup_router_route(&ingress.device, packet.src_ip)? else {
@@ -481,16 +511,15 @@ impl Engine {
                 },
             )
         } else {
-            // Only disposal of our typed error packets belongs to increment 04.
+            // Discard errors, including legacy tags, without a secondary error.
             // Ordinary originals and Host Unreachable remain pending for 05b.
             let pending = self
                 .router_arp_mut(&endpoint)?
                 .pending
                 .remove(&target)
                 .unwrap_or_default();
-            let (errors, originals): (VecDeque<_>, VecDeque<_>) = pending
-                .into_iter()
-                .partition(|p| matches!(p.packet.payload, Ipv4Payload::IcmpError(_)));
+            let (errors, originals): (VecDeque<_>, VecDeque<_>) =
+                pending.into_iter().partition(|p| is_icmp_error(&p.packet));
             let has_originals = !originals.is_empty();
             if has_originals {
                 self.router_arp_mut(&endpoint)?
@@ -623,46 +652,56 @@ mod tests {
         }
     }
     #[test]
-    fn unsupported_error_paths_fail_closed_before_forwarding_or_arp() {
-        for (ttl, source, target, broadcast) in [
+    fn inadmissible_ipv4_has_normative_drop_before_forwarding_or_arp() {
+        for (ttl, source, target, broadcast, expected) in [
             (
                 64,
                 Ipv4Address([192, 168, 1, 10]),
                 Ipv4Address([192, 168, 1, 1]),
                 true,
+                DropReason::UnsupportedIpDestination,
             ),
             (
                 64,
                 Ipv4Address([0, 0, 0, 0]),
                 Ipv4Address([192, 168, 1, 1]),
                 false,
+                DropReason::InvalidIpv4Source,
             ),
             (
                 64,
                 Ipv4Address([192, 168, 1, 255]),
                 Ipv4Address([192, 168, 1, 1]),
                 false,
+                DropReason::InvalidIpv4Source,
             ),
             (
                 64,
                 Ipv4Address([192, 168, 1, 10]),
                 Ipv4Address([10, 0, 0, 255]),
                 false,
+                DropReason::UnsupportedIpDestination,
             ),
             (
                 64,
                 Ipv4Address([192, 168, 1, 10]),
                 Ipv4Address([224, 0, 0, 1]),
                 false,
+                DropReason::UnsupportedIpDestination,
             ),
         ] {
             let mut e = fixture();
             inject(&mut e, ttl, source, target, broadcast);
-            assert_eq!(
-                e.step_events(1),
-                Err(EngineError::RouterIcmpErrorPathPending)
+            e.run_until_quiescent(1000).unwrap();
+            let trace = e.get_trace_snapshot();
+            assert_eq!(trace.records.len(), 2);
+            assert!(matches!(
+                &trace.records[0].event,
+                ObservableEvent::FrameDelivered { .. }
+            ));
+            assert!(
+                matches!(&trace.records[1].event,ObservableEvent::PacketDropped {reason,pdu:DroppedPdu::Ipv4(p),..} if *reason==expected && p.src_ip==source && p.dst_ip==target && p.ttl==ttl)
             );
-            assert_eq!(e.get_trace_snapshot().records.len(), 1); // only the actual FrameDelivered observation
             assert_eq!(e.now().0, 0);
         }
     }

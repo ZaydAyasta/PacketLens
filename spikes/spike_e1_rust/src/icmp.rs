@@ -32,22 +32,28 @@ impl OriginalDatagramSummary {
 pub enum IcmpErrorPacket {
     TimeExceeded { original: OriginalDatagramSummary },
     DestinationNetworkUnreachable { original: OriginalDatagramSummary },
+    DestinationHostUnreachable { original: OriginalDatagramSummary },
 }
 impl IcmpErrorPacket {
     pub fn icmp_type(&self) -> u8 {
         match self {
             Self::TimeExceeded { .. } => 11,
-            Self::DestinationNetworkUnreachable { .. } => 3,
+            Self::DestinationNetworkUnreachable { .. }
+            | Self::DestinationHostUnreachable { .. } => 3,
         }
     }
     pub fn code(&self) -> u8 {
-        0
+        if matches!(self, Self::DestinationHostUnreachable { .. }) {
+            1
+        } else {
+            0
+        }
     }
     pub fn original(&self) -> &OriginalDatagramSummary {
         match self {
-            Self::TimeExceeded { original } | Self::DestinationNetworkUnreachable { original } => {
-                original
-            }
+            Self::TimeExceeded { original }
+            | Self::DestinationNetworkUnreachable { original }
+            | Self::DestinationHostUnreachable { original } => original,
         }
     }
 }

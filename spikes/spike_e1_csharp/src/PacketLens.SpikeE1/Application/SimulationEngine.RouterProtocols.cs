@@ -8,10 +8,14 @@ public sealed partial class SimulationEngine
     private sealed record RouterArpRetryEvent(Endpoint Endpoint,Ipv4Address Target,byte Attempt,ulong Epoch) : SimulationEvent;
     private sealed record RouterPendingPacket(Ipv4Packet Packet,Endpoint? Ingress,EthernetFrame? Received);
 
+    private static bool IsIcmpError(Ipv4Packet packet) => packet.Payload is IcmpErrorMessage
+        || packet.Payload.Kind is IcmpKind.TimeExceeded or IcmpKind.DestinationHostUnreachable or IcmpKind.DestinationNetworkUnreachable;
+
     private void ReceiveAtRouter(Endpoint endpoint,EthernetFrame frame)
     {
         var port=FindInterface(endpoint);
-        if (frame.DestinationMac != port.Mac && frame.DestinationMac != MacAddress.Broadcast)
+        var groupIpv4 = frame.Payload is Ipv4Packet && (frame.DestinationMac.A & 1) != 0;
+        if (frame.DestinationMac != port.Mac && frame.DestinationMac != MacAddress.Broadcast && !groupIpv4)
         { DropEthernet(endpoint,frame,DropReason.DestinationMacMismatch); return; }
         if (frame.Payload is Ipv4Packet ipv4) { RouteReceivedIpv4(endpoint,frame,ipv4); return; }
         if (frame.Payload is not ArpPacket arp) return;
@@ -50,13 +54,33 @@ public sealed partial class SimulationEngine
         return _devices[endpoint.Device].RouterArpCache.TryGetValue((endpoint.InterfaceName,ip),out var entry) ? entry.Mac : null;
     }
 
+    internal void SeedRouterArpForTesting(Endpoint endpoint, Ipv4Address ip, MacAddress mac)
+    {
+        EnsureIpv4ConfigurationIdle();
+        if (_currentTimeNs!=0 || Trace.TotalEmittedEver!=0) throw new InvalidOperationException("Seeds are fixture setup at t=0 only.");
+        _ = FindInterface(endpoint);
+        _ = Router(endpoint.Device);
+        var epoch=NextEpoch();
+        _devices[endpoint.Device].RouterArpCache[(endpoint.InterfaceName,ip)]=new ArpCacheEntry(mac,epoch);
+        Schedule(ArpCacheTtlNs,new RouterArpExpireEvent(endpoint,ip,epoch));
+    }
+
     private void RouteReceivedIpv4(Endpoint ingress,EthernetFrame received,Ipv4Packet packet)
     {
         var router=_devices[ingress.Device];
         bool OwnBroadcast(Ipv4Address ip)=>router.Interfaces.Values.Any(p=>p.Ipv4 is { } address && new Ipv4Network(address.Address,address.PrefixLength).Broadcast==ip);
-        if ((received.DestinationMac.A & 1) != 0 || !Ipv4InterfaceAddress.IsUnicast(packet.SourceIp) || !Ipv4InterfaceAddress.IsUnicast(packet.DestinationIp)
-            || OwnBroadcast(packet.SourceIp) || OwnBroadcast(packet.DestinationIp))
-            throw new SimulationException(SimulationErrorCode.RouterIcmpErrorPathPending);
+        if ((received.DestinationMac.A & 1) != 0 || packet.DestinationIp.A is >=224 and <=239
+            || packet.DestinationIp==new Ipv4Address(255,255,255,255) || OwnBroadcast(packet.DestinationIp))
+        {
+            _trace.Add(new PacketDropped(_currentTimeNs,ingress.Device,ingress.InterfaceName,null,packet,DropReason.UnsupportedIpDestination));
+            return;
+        }
+        if (packet.SourceIp.A is 0 or 127 or (>=224 and <=239)
+            || packet.SourceIp==new Ipv4Address(255,255,255,255) || OwnBroadcast(packet.SourceIp))
+        {
+            _trace.Add(new PacketDropped(_currentTimeNs,ingress.Device,ingress.InterfaceName,null,packet,DropReason.InvalidIpv4Source));
+            return;
+        }
         if (router.Interfaces.Values.Any(p => p.Ipv4?.Address==packet.DestinationIp))
         {
             if (packet.Payload.Kind != IcmpKind.EchoRequest) return;
@@ -83,7 +107,7 @@ public sealed partial class SimulationEngine
     private void RecordRouterFailure(Endpoint ingress,Ipv4Packet original,DropReason reason)
     {
         _trace.Add(new PacketDropped(_currentTimeNs,ingress.Device,ingress.InterfaceName,null,original,reason));
-        if (original.Payload is IcmpErrorMessage) return;
+        if (IsIcmpError(original)) return;
         var route=LookupRouterRoute(ingress.Device,original.SourceIp);
         if (route is null) return;
         var endpoint=Endpoint.Of(ingress.Device,route.EgressInterface);
@@ -128,8 +152,8 @@ public sealed partial class SimulationEngine
             var owner=_devices[timer.Endpoint.Device];var pendingKey=(timer.Endpoint.InterfaceName,timer.Target);
             if (owner.RouterPending.TryGetValue(pendingKey,out var packets))
             {
-                var errors=packets.FindAll(p=>p.Packet.Payload is IcmpErrorMessage);
-                packets.RemoveAll(p=>p.Packet.Payload is IcmpErrorMessage);
+                var errors=packets.FindAll(p=>IsIcmpError(p.Packet));
+                packets.RemoveAll(p=>IsIcmpError(p.Packet));
                 foreach (var error in errors)
                     _trace.Add(new PacketDropped(_currentTimeNs,timer.Endpoint.Device,timer.Endpoint.InterfaceName,null,error.Packet,DropReason.ArpResolutionFailed));
                 if (packets.Count>0) throw new SimulationException(SimulationErrorCode.RouterIcmpErrorPathPending);

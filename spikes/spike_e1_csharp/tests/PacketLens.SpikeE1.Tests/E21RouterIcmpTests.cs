@@ -135,7 +135,7 @@ public sealed class E21RouterIcmpTests(Xunit.Abstractions.ITestOutputHelper outp
         var drop=Assert.Single(e.Trace.Records.OfType<PacketDropped>());Assert.Equal("r2",drop.Device);Assert.Equal(DropReason.TtlExpiredInTransit,drop.Reason);Assert.Equal(1,drop.Ipv4Packet!.Ttl);
         Assert.Equal(9900UL,e.CurrentTimeNs);
     }
-    private static string[] ObservationProjection(SimulationEngine e,string label)
+    internal static string[] ObservationProjection(SimulationEngine e,string label)
     {
         static string Address(Ipv4Address a)=>$"{a.A}.{a.B}.{a.C}.{a.D}";
         static string MacText(MacAddress m)=>$"{m.A:x2}:{m.B:x2}:{m.C:x2}:{m.D:x2}:{m.E:x2}:{m.F:x2}";

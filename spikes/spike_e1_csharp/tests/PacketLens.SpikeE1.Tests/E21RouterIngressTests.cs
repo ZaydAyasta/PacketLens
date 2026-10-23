@@ -28,13 +28,16 @@ public sealed class E21RouterIngressTests
     }
 
     [Theory]
-    [InlineData(64,"192.168.1.10","192.168.1.1",true)][InlineData(64,"0.0.0.0","192.168.1.1",false)]
-    [InlineData(64,"192.168.1.255","192.168.1.1",false)][InlineData(64,"192.168.1.10","10.0.0.255",false)][InlineData(64,"192.168.1.10","224.0.0.1",false)]
-    public void UnsupportedErrorPathsFailClosedBeforeForwardingOrArp(int ttl,string source,string target,bool broadcast)
+    [InlineData(64,"192.168.1.10","192.168.1.1",true,DropReason.UnsupportedIpDestination)][InlineData(64,"0.0.0.0","192.168.1.1",false,DropReason.InvalidIpv4Source)]
+    [InlineData(64,"192.168.1.255","192.168.1.1",false,DropReason.InvalidIpv4Source)][InlineData(64,"192.168.1.10","10.0.0.255",false,DropReason.UnsupportedIpDestination)][InlineData(64,"192.168.1.10","224.0.0.1",false,DropReason.UnsupportedIpDestination)]
+    public void InadmissibleIpv4HasNormativeDropBeforeForwardingOrArp(int ttl,string source,string target,bool broadcast,DropReason expected)
     {
         var e=Fixture(); Inject(e,ttl,source,target,broadcast);
-        Assert.Equal(SimulationErrorCode.RouterIcmpErrorPathPending,Assert.Throws<SimulationException>(()=>e.StepEvents(1)).Code);
-        Assert.IsType<FrameDelivered>(Assert.Single(e.Trace.Records)); Assert.Equal(0UL,e.CurrentTimeNs);
+        e.RunUntilQuiescent(1000);Assert.Equal(2,e.Trace.Records.Count);
+        Assert.IsType<FrameDelivered>(e.Trace.Records[0]);var drop=Assert.IsType<PacketDropped>(e.Trace.Records[1]);
+        Assert.Equal(expected,drop.Reason);Assert.Null(drop.EthernetFrame);
+        Assert.Equal(Ip(source),drop.Ipv4Packet!.SourceIp);Assert.Equal(Ip(target),drop.Ipv4Packet.DestinationIp);Assert.Equal((byte)ttl,drop.Ipv4Packet.Ttl);
+        Assert.Equal(0UL,e.CurrentTimeNs);
     }
 
     [Fact]

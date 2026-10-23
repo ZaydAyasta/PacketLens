@@ -236,6 +236,8 @@ pub enum DropReason {
     Ipv4DestinationMismatch,
     NoRouteToHost,
     TtlExpiredInTransit,
+    UnsupportedIpDestination,
+    InvalidIpv4Source,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,7 +420,7 @@ pub struct ExecutionReport {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
-    /// The successful routing increment does not yet generate ICMP errors.
+    /// Router failure path still outside the implemented increments.
     RouterIcmpErrorPathPending,
     EngineBusy,
     Ipv4Configuration(ipv4::ConfigurationError),

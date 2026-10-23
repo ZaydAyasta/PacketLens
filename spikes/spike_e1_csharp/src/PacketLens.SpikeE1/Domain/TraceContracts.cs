@@ -25,7 +25,9 @@ public enum DropReason
     ArpTargetIpMismatch,
     DestinationMacMismatch,
     NoRouteToHost,
-    TtlExpiredInTransit
+    TtlExpiredInTransit,
+    UnsupportedIpDestination,
+    InvalidIpv4Source
 }
 
 public enum PingFailureReason { ArpTimeout }
