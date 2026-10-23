@@ -1,5 +1,12 @@
 # Integración controlada del Inspector Educativo avanzado
 
+**Actualización 2026-10-22:** la vertical ya fue compilada y ejecutada en
+Windows. Vitest: 26/26; host: 2/2; aceptación nativa WebView2/IPC: 1/1,
+incluida preservación de sesión ante rechazo nativo. Evidencia, correcciones y
+límites en [E1-NATIVE-INTEGRATION.md](E1-NATIVE-INTEGRATION.md).
+Las secciones siguientes conservan el registro histórico del 2026-10-19;
+sus bloqueos no representan el estado vigente fuera del sandbox.
+
 Fecha: 2026-10-19
 
 ## Alcance y resultado

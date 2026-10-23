@@ -16,6 +16,9 @@ Simulador de redes educativo, de escritorio y open source, independiente de Cisc
 - No modificar la especificación sin documentar el motivo en un ADR pequeño.
 - Ante una ambigüedad material, documentar la decisión mínima y su test; comunicarla en el resumen.
 
+## Política TDD
+- Para cambios de comportamiento, defectos, refactorizaciones, contratos u optimizaciones, seguir `docs/engineering/TDD-POLICY.md`. Las especificaciones, addenda y ADR aplicables prevalecen; detener el cambio ante una contradicción normativa.
+
 ## Definición de terminado
 - Los escenarios E1 implementados tienen pruebas ejecutables en Rust (`cargo test`) y C# (`dotnet test`).
 - Se entregan instrucciones concretas para ejecutar ambos y un reporte de diferencias verificadas.

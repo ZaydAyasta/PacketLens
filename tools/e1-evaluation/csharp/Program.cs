@@ -14,6 +14,16 @@ internal static class Program
     private static void Main(string[] args)
     {
         var command = args.ElementAtOrDefault(0);
+        if (command == "e21-router")
+        {
+            E21RouterProbe.Run();
+            return;
+        }
+        if (command == "e21-configuration")
+        {
+            E21ConfigurationProbe.Run();
+            return;
+        }
         if (command == "reports")
         {
             foreach (var report in new[] { ScenarioS1(), ScenarioS2(), ScenarioS3A(), ScenarioS3B(), ScenarioS4(), ScenarioS5(), ScenarioS6() })

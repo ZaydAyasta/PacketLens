@@ -4,10 +4,11 @@
 
 Este documento describe la vertical experimental aprobada para E1-S2 frio. No
 es la arquitectura definitiva de escritorio ni una aprobacion de distribucion.
-La aplicacion ya compone el Inspector Educativo avanzado con el fixture real
-de E1-S2. Aun no se ha compilado el host, no se ha abierto una ventana y no se
-ha ejecutado una invocacion real Vue a Rust. Las evidencias y bloqueos vigentes
-constan en `docs/reports/INSPECTOR-ADVANCED-INTEGRATION.md`.
+La aplicacion compone el Inspector Educativo avanzado. El 2026-10-22 se
+compilo y abrio el ejecutable Windows y se valido IPC real Vue a Rust: 27
+eventos, 8700 ns, Quiescent y procedencia live_engine. Tambien se comprobo que
+un rechazo nativo conserva la sesion previa y permite una nueva ejecucion.
+La evidencia vigente consta en [E1-NATIVE-INTEGRATION.md](../reports/E1-NATIVE-INTEGRATION.md).
 
 `SimulationPresentationSnapshot v1` es el unico dato que cruza la frontera de
 presentacion. El bridge no expone tipos de dominio Rust, eventos internos del
@@ -53,9 +54,9 @@ filesystem, red, shell ni plugins.
 `presentationSourceState` captura el rechazo, deja el snapshot anterior intacto
 y libera el estado de ejecucion; `App.vue` lo presenta con `role="alert"`.
 `tauriBridge.test.ts` cubre el orden `contract_version` -> `run_e1_s2_cold` y
-la version incompatible. Las pruebas no se pudieron ejecutar en este sandbox
-porque Vitest falla al arrancar esbuild (`spawn EPERM`), por lo que no se
-declaran validadas hasta ejecutarlas en un entorno compatible.
+la version incompatible. Las 26 pruebas Vitest pasaron en Windows fuera del
+sandbox. `npm run test:native` verifica ademas el transporte del WebView2 real;
+no devuelve respuestas fabricadas ni usa el fixture para satisfacer el IPC.
 
 ## Ejecucion y empaquetado minimo
 
@@ -66,52 +67,92 @@ Cargo resolubles y permisos para que Node cree el subproceso de esbuild:
 Set-Location E:\packetlens\apps\packetlens-e1-vertical
 npm ci
 npm test
-npm run build
 $env:Path = "C:\Users\familia\.cargo\bin;$env:Path"
-& cargo test --manifest-path src-tauri\Cargo.toml --test bridge_commands
-npm run tauri -- dev
+cargo fetch --manifest-path src-tauri\Cargo.toml --locked --target x86_64-pc-windows-msvc
+cargo test --manifest-path src-tauri\Cargo.toml --locked
+npm run test:native
 ```
 
-La aceptacion de la vertical requiere observar una ventana Tauri, pulsar el
-boton y comprobar que la respuesta validada tiene `presentation/v1`, 27 eventos,
-`Quiescent` y `8700` ns. Ningun comando anterior se considera exitoso sin esa
-observacion ni sin las pruebas Vitest y Rust verdes.
+`test:native` ejecuta primero su hook `pretest:native`: compila frontend y un
+binario debug con assets embebidos mediante Tauri. Luego abre ese binario en
+una instancia WebView2 con perfil aislado y puerto de inspeccion loopback
+temporal, pulsa el boton, verifica el JSON real y la vista, provoca un rechazo
+real de comando y comprueba preservacion y recuperacion. Cierra su instancia
+y su puerto al finalizar; no cambia configuracion global de WebView2.
+
+Los resultados quedan en `test-results/native-e1.json`, `native-e1-live.png`
+y `native-e1-preserved.png`. El detalle y los limites de la inyeccion de fallo
+estan en el informe de integracion. Los perfiles de prueba quedan bajo
+`src-tauri/target/webview2-e1-*` para inspeccion local.
+
+Para abrir la aplicacion normal despues de las pruebas:
+
+```powershell
+Start-Process .\src-tauri\target\debug\packetlens-e1-vertical.exe
+```
+
+La interfaz muestra `8.700 µs`, equivalente a `8700 ns` (8.700 nanosegundos).
+El contrato conserva la cadena decimal `"8700"`. La procedencia visible es
+`Ejecucion viva del motor Rust`, correspondiente a `live_engine`.
+
+Cerrar las ventanas PacketLens antes de volver a compilar: Windows bloquea
+el reemplazo de un ejecutable en uso. Ejecutar `cargo test` antes de
+`test:native`; el hook recompila con los assets embebidos y evita reutilizar
+accidentalmente el binario de desarrollo que espera un servidor Vite.
+
+Para desarrollo interactivo con Vite, el comando es:
+
+```powershell
+npm run tauri -- dev --no-watch -- --locked
+```
+
+La aceptacion automatizada de esta entrega uso el ejecutable con assets
+embebidos; no se presenta ese comando dev como una prueba adicional ejecutada.
 
 Para producir solo el ejecutable de validacion, sin instalador, despues de las
 pruebas verdes:
 
 ```powershell
-npm run tauri -- build -- --no-bundle
+npm run tauri -- build --no-bundle -- --locked
 ```
 
 La configuracion actual declara `bundle.active = false`; por tanto no se
 generara instalador. La CLI instalada confirma que `--no-bundle` salta el paso
 de bundling. La ruta esperada del binario de release es
-`src-tauri\target\release\packetlens-e1-vertical.exe`; aun no fue producida en
-este entorno.
+`src-tauri\target\release\packetlens-e1-vertical.exe`. Esta entrega produjo y
+valido la variante debug con `build --debug --no-bundle -- --locked`, en
+`src-tauri\target\debug\packetlens-e1-vertical.exe`; no produjo release.
+
+`--no-bundle` es una opcion de Tauri y debe preceder al segundo `--`.
+`--locked` es un argumento de Cargo y lo sigue. La sintaxis debug fue ejecutada
+con exito por la CLI local; la forma anterior `build -- --no-bundle` colocaba
+incorrectamente una opcion Tauri en los argumentos de Cargo.
 
 Un instalador Windows requiere una decision posterior para activar un bundle y
 elegir `msi` o `nsis`, junto con pruebas en una maquina limpia y una politica de
 firma. No se cambia esa configuracion experimental ahora.
 
-## Bloqueos actuales, no decisiones de arquitectura
+## Entorno y dependencias
 
-- Vitest/Vite falla antes de descubrir pruebas: Node recibe `spawn EPERM` al
-  iniciar el servicio de esbuild. Una sonda que intenta crear otro proceso Node
-  también recibe `EPERM`, por lo que no es un defecto específico de esbuild.
-- La CLI Tauri inicialmente no encontro Cargo porque este no estaba en `PATH`
-  de npm. El 2026-10-19, exponiendo solo para el proceso
-  `C:\Users\familia\.cargo\bin`, alcanzo `beforeDevCommand` y se detuvo en el
-  mismo `spawn EPERM` de Vite. No se alcanzo la compilacion del host ni una
-  ventana.
-- Cargo no tiene fuentes locales de `tauri`; con red habilitada el proxy
-  configurado `127.0.0.1:9` no alcanza `index.crates.io:443`. Al retirar las
-  variables de proxy solo para el proceso de prueba, Schannel devuelve
-  `SEC_E_NO_CREDENTIALS`; tampoco hay una ruta directa autenticada al registro.
-  No se llego a compilacion del host ni se atribuye un error al codigo Tauri.
-- WSL existe en el host, pero `wsl --status` devuelve
-  `Wsl/EnumerateDistros/Service/E_ACCESSDENIED`; Docker no esta instalado. Esta
-  sesión no puede abrir un entorno alternativo sin dichos bloqueos.
+Las verificaciones vigentes se ejecutaron en Windows fuera del sandbox que
+restringe tuberias de Node con `spawn EPERM`. No se debilitaron protecciones
+del sistema ni TLS. No son necesarios WSL ni Docker para esta vertical.
 
-Resolver esos prerequisitos permitira ejecutar la vertical sin cambiar de
-contrato ni de arquitectura.
+Se versiona `src-tauri/Cargo.lock`: tauri 2.12.5 es compatible por version minor
+con API npm 2.12.4. Se conservaron las versiones npm existentes; solo se anadio
+`playwright-core` 1.64.1 para aceptar el WebView2 instalado, sin descargar otro
+navegador, y se retiro `@vue/tsconfig`, no utilizado y con un peer TypeScript
+incompatible. `npm ci` paso sin flags para ignorar peers.
+
+Los iconos minimos proceden de `src-tauri/icons/icon.svg`. Para regenerarlos:
+
+```powershell
+npm run tauri -- icon src-tauri/icons/icon.svg --output src-tauri/target/icon-generation
+Copy-Item src-tauri/target/icon-generation/icon.ico src-tauri/icons/icon.ico
+Copy-Item src-tauri/target/icon-generation/icon.png src-tauri/icons/icon.png
+```
+
+No se hizo una migracion mayor de Vitest para resolver avisos de auditoria
+de desarrollo ajenos al bloqueo de integracion. Esos avisos y las advertencias
+de engines opcionales constan en el informe; `npm audit --omit=dev` informo cero
+vulnerabilidades. Esto no constituye una aprobacion de distribucion.

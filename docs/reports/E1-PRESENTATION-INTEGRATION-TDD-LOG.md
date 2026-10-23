@@ -1,5 +1,16 @@
 # Evidencia TDD e integración de presentación E1
 
+## Seguimiento autorizado del 2026-10-22
+
+El registro original se conserva debajo. El fallo CAM se reprodujo con
+`npm test -- src/adapters/presentationAdapter.test.ts`: 5 pasadas, 1 fallida.
+Tras nombrar CAM en el rationale del catálogo, sin cambiar aserciones: 6/6.
+La suite completa posterior a `npm ci` pasó 26/26. El host pasó dos pruebas
+tras resolver icono faltante y conflicto de macros E0255. La aceptación nativa
+del WebView2 pasó 1/1, con éxito IPC, rechazo real, preservación y recuperación.
+Comandos, fallos intermedios y evidencia duradera:
+[E1-NATIVE-INTEGRATION.md](E1-NATIVE-INTEGRATION.md).
+
 Fecha: 2026-10-18. Alcance: contrato `presentation/v1`, exportadores E1-S2
 frío, consumidor Vue aislado y bridge Tauri experimental.
 

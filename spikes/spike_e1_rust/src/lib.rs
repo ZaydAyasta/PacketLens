@@ -83,6 +83,9 @@ static TEST_ALLOCATOR: test_allocation::TrackingAllocator = test_allocation::Tra
 /// Contrato de lectura para consumidores de presentaciÃ³n. No forma parte del
 /// dominio E1 ni del reporte canÃ³nico definido por ADR-0002.
 pub mod presentation;
+pub mod ipv4;
+pub mod routing;
+pub mod router_engine;
 
 pub const LINK_PROPAGATION_DELAY_NS: u64 = 1_000;
 pub const DEVICE_PROCESSING_DELAY_NS: u64 = 100;
@@ -395,6 +398,8 @@ pub struct ExecutionReport {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
+    EngineBusy,
+    Ipv4Configuration(ipv4::ConfigurationError),
     DuplicateId(String),
     UnknownDevice(DeviceRef),
     UnknownInterface(EndpointRef),
@@ -477,6 +482,7 @@ pub enum CommandResult {
 
 #[derive(Clone, Debug)]
 struct Interface {
+    ipv4_mode: ipv4::Ipv4LinkMode,
     mac: Option<MacAddress>,
     ipv4: Option<(Ipv4Address, u8)>,
     admin_up: bool,
@@ -486,6 +492,7 @@ struct Interface {
 impl Interface {
     fn unconfigured() -> Self {
         Self {
+            ipv4_mode: ipv4::Ipv4LinkMode::MultiAccess,
             mac: None,
             ipv4: None,
             admin_up: false,
@@ -522,6 +529,7 @@ struct PendingPacket {
 #[derive(Clone, Debug)]
 struct Host {
     interfaces: BTreeMap<InterfaceName, Interface>,
+    ipv4_configuration: Option<(InterfaceName, ipv4::HostIpv4Config)>,
     arp_cache: BTreeMap<Ipv4Address, ArpEntry>,
     pending_arp_queue: BTreeMap<Ipv4Address, VecDeque<PendingPacket>>,
     resolutions: BTreeMap<Ipv4Address, ActiveResolution>,
@@ -537,6 +545,7 @@ struct Switch {
 enum Device {
     Host(Host),
     Switch(Switch),
+    Router(router_engine::Router),
 }
 
 impl Device {
@@ -544,12 +553,14 @@ impl Device {
         match self {
             Self::Host(host) => &host.interfaces,
             Self::Switch(switch) => &switch.interfaces,
+            Self::Router(router) => &router.interfaces,
         }
     }
     fn interfaces_mut(&mut self) -> &mut BTreeMap<InterfaceName, Interface> {
         match self {
             Self::Host(host) => &mut host.interfaces,
             Self::Switch(switch) => &mut switch.interfaces,
+            Self::Router(router) => &mut router.interfaces,
         }
     }
 }
@@ -752,6 +763,7 @@ impl Engine {
         self.devices.insert(
             device,
             Device::Host(Host {
+                ipv4_configuration: None,
                 interfaces: ports
                     .into_iter()
                     .map(|p| (p, Interface::unconfigured()))
@@ -793,16 +805,96 @@ impl Engine {
         ipv4: Option<(Ipv4Address, u8)>,
         admin_up: bool,
     ) -> Result<(), EngineError> {
+        if matches!(self.devices.get(&endpoint.device), Some(Device::Router(_))) {
+            return self.configure_router_port(endpoint, mac, ipv4, admin_up);
+        }
         if let Some((_, prefix)) = ipv4
             && prefix > 32
         {
             return Err(EngineError::InvalidHostConfiguration(endpoint.device));
         }
+        let updated = if let Some(Device::Host(host)) = self.devices.get(&endpoint.device)
+            && let Some((selected, config)) = &host.ipv4_configuration
+        {
+            self.ensure_ipv4_configuration_idle()?;
+            if selected == &endpoint.interface {
+                let (address, prefix) = ipv4.ok_or_else(|| {
+                    EngineError::InvalidHostConfiguration(endpoint.device.clone())
+                })?;
+                let value = ipv4::Ipv4InterfaceConfig::new(address, prefix)
+                    .map_err(EngineError::Ipv4Configuration)?;
+                Some(
+                    ipv4::HostIpv4Config::new(value, config.default_gateway())
+                        .map_err(EngineError::Ipv4Configuration)?,
+                )
+            } else {
+                if ipv4.is_some() {
+                    return Err(EngineError::InvalidHostConfiguration(endpoint.device));
+                }
+                None
+            }
+        } else {
+            None
+        };
         let iface = self.interface_mut(&endpoint)?;
         iface.mac = Some(mac);
         iface.ipv4 = ipv4;
         iface.admin_up = admin_up;
+        if let Some(config) = updated
+            && let Some(Device::Host(host)) = self.devices.get_mut(&endpoint.device)
+        {
+            host.ipv4_configuration = Some((endpoint.interface, config));
+        }
         Ok(())
+    }
+
+    /// Configure E2.1 addressing without activating routed packet processing.
+    pub fn configure_host_ipv4(
+        &mut self,
+        endpoint: EndpointRef,
+        mac: MacAddress,
+        config: ipv4::HostIpv4Config,
+        admin_up: bool,
+    ) -> Result<(), EngineError> {
+        self.ensure_ipv4_configuration_idle()?;
+        self.interface(&endpoint)?;
+        let Some(Device::Host(host)) = self.devices.get(&endpoint.device) else {
+            return Err(EngineError::InvalidHostConfiguration(endpoint.device));
+        };
+        if host.interfaces.iter().any(|(name, iface)| {
+            name != &endpoint.interface && iface.ipv4.is_some()
+        }) {
+            return Err(EngineError::InvalidHostConfiguration(endpoint.device));
+        }
+        let Some(Device::Host(host)) = self.devices.get_mut(&endpoint.device) else {
+            return Err(EngineError::InvalidHostConfiguration(endpoint.device));
+        };
+        let iface = host.interfaces
+            .get_mut(&endpoint.interface)
+            .ok_or_else(|| EngineError::UnknownInterface(endpoint.clone()))?;
+        iface.mac = Some(mac);
+        iface.ipv4 = Some((
+            config.interface().address(),
+            config.interface().network().prefix().value(),
+        ));
+        iface.admin_up = admin_up;
+        host.ipv4_configuration = Some((endpoint.interface, config));
+        Ok(())
+    }
+
+    pub fn host_ipv4_config(&self, device: &DeviceRef) -> Option<ipv4::HostIpv4Config> {
+        match self.devices.get(device) {
+            Some(Device::Host(host)) => host.ipv4_configuration.as_ref().map(|(_, config)| *config),
+            _ => None,
+        }
+    }
+
+    fn ensure_ipv4_configuration_idle(&self) -> Result<(), EngineError> {
+        if self.has_active_work() || !self.pings.is_empty() {
+            Err(EngineError::EngineBusy)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn set_interface_admin_state(
@@ -870,6 +962,7 @@ impl Engine {
         identifier: u16,
         sequence: u16,
     ) -> Result<(), EngineError> {
+        self.validate_ipv4_topology()?;
         let (endpoint, _, source_ip) = self.host_interface_for(&source, target_ip)?;
         let key = PingKey {
             source: source.clone(),
@@ -1440,6 +1533,8 @@ impl Engine {
         match self.devices.get(&dst.device) {
             Some(Device::Host(_)) => self.host_received_frame(dst, frame),
             Some(Device::Switch(_)) => self.switch_received_frame(dst, frame),
+            // Router packet processing belongs to the next increment.
+            Some(Device::Router(_)) => Ok(()),
             None => Err(EngineError::UnknownDevice(dst.device)),
         }
     }

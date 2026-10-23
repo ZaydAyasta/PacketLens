@@ -2,7 +2,7 @@ using PacketLens.SpikeE1.Domain;
 
 namespace PacketLens.SpikeE1.Application;
 
-public sealed class SimulationEngine
+public sealed partial class SimulationEngine
 {
     public const ulong LinkPropagationDelayNs = 1_000;
     public const ulong DeviceProcessingDelayNs = 100;
@@ -46,14 +46,54 @@ public sealed class SimulationEngine
     {
         if (prefixLength > 32) throw new ArgumentOutOfRangeException(nameof(prefixLength));
         var port = FindInterface(endpoint);
+        if (_devices[endpoint.Device].Router is not null)
+        {
+            ConfigureRouterPort(endpoint,mac,address,prefixLength,adminUp);
+            return;
+        }
+        HostIpv4Settings? revised = null;
+        if (_devices[endpoint.Device].ConfiguredIpv4 is { } configured)
+        {
+            EnsureIpv4ConfigurationIdle();
+            if (configured.Interface == endpoint.InterfaceName)
+            {
+                if (address is null) throw new ArgumentException("The configured IPv4 host requires an address.",nameof(address));
+                revised = new HostIpv4Settings(new Ipv4InterfaceAddress(address.Value,prefixLength),configured.Settings.DefaultGateway);
+            }
+            else if (address is not null) throw new ArgumentException("An E2.1 host has one selected IPv4 interface.",nameof(address));
+        }
         port.Mac = mac;
         port.Ipv4 = address is null ? null : new Ipv4Configuration(address.Value, prefixLength);
         port.AdminUp = adminUp;
+        if (revised is not null) _devices[endpoint.Device].ConfiguredIpv4 = (endpoint.InterfaceName,revised);
+    }
+
+    public void ConfigureHostIpv4(Endpoint endpoint, MacAddress mac, HostIpv4Settings settings, bool adminUp)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        EnsureIpv4ConfigurationIdle();
+        var port = FindInterface(endpoint);
+        var host = _devices[endpoint.Device];
+        if (!host.IsHost || host.Interfaces.Any(pair => pair.Key != endpoint.InterfaceName && pair.Value.Ipv4 is not null))
+            throw new ArgumentException("An E2.1 host has one selected IPv4 interface.",nameof(endpoint));
+        port.Mac = mac;
+        port.Ipv4 = new Ipv4Configuration(settings.Interface.Address,(byte)settings.Interface.Network.Prefix.Value);
+        port.AdminUp = adminUp;
+        host.ConfiguredIpv4 = (endpoint.InterfaceName,settings);
+    }
+
+    public HostIpv4Settings? HostIpv4Configuration(string host) =>
+        _devices.TryGetValue(host,out var device) ? device.ConfiguredIpv4?.Settings : null;
+
+    private void EnsureIpv4ConfigurationIdle()
+    {
+        if (HasActiveWork() || _pingStarts.Count != 0) throw new SimulationException(SimulationErrorCode.EngineBusy);
     }
 
     public void ConnectLink(string link, Endpoint a, Endpoint b)
     {
         if (_links.ContainsKey(link)) throw new ArgumentException("Duplicate link.", nameof(link));
+        if (a == b) throw new ArgumentException("A link requires two distinct interfaces.",nameof(b));
         var first = FindInterface(a);
         var second = FindInterface(b);
         if (first.LinkInstance is not null || second.LinkInstance is not null) throw new InvalidOperationException("An endpoint already has a link.");
@@ -79,6 +119,7 @@ public sealed class SimulationEngine
 
     public void SendPing(string source, Ipv4Address targetIp, ushort identifier, ushort sequence)
     {
+        ValidateIpv4Topology();
         var (_, port) = FindHostPortFor(source, targetIp);
         _pingStarts.Add(new PingKey(source, targetIp, identifier, sequence), _currentTimeNs);
         var packet = new Ipv4Packet(port.Ipv4!.Address, targetIp, 64, new IcmpPacket(IcmpKind.EchoRequest, identifier, sequence));
@@ -302,7 +343,8 @@ public sealed class SimulationEngine
 
         _trace.Add(new FrameDelivered(_currentTimeNs, linkName, arrival.Destination, arrival.Frame));
         if (_devices[arrival.Destination.Device].IsHost) ReceiveAtHost(arrival.Destination, arrival.Frame);
-        else ReceiveAtSwitch(arrival.Destination, arrival.Frame);
+        // Router packet processing is deliberately not enabled in this increment.
+        else if (_devices[arrival.Destination.Device].Router is null) ReceiveAtSwitch(arrival.Destination, arrival.Frame);
     }
 
     private void ReceiveAtHost(Endpoint endpoint, EthernetFrame frame)
@@ -493,6 +535,8 @@ public sealed class SimulationEngine
 
     private sealed class DeviceState(bool isHost, IReadOnlyList<string> names)
     {
+        public RouterConfiguration? Router { get; set; }
+        public (string Interface, HostIpv4Settings Settings)? ConfiguredIpv4 { get; set; }
         public bool IsHost { get; } = isHost;
         public SortedDictionary<string, InterfaceState> Interfaces { get; } = new(names.ToDictionary(name => name, _ => new InterfaceState(), StringComparer.Ordinal), StringComparer.Ordinal);
         public SortedDictionary<Ipv4Address, ArpCacheEntry> ArpCache { get; } = [];
@@ -503,6 +547,7 @@ public sealed class SimulationEngine
 
     private sealed class InterfaceState
     {
+        public Ipv4LinkMode Ipv4Mode { get; set; }
         public MacAddress? Mac { get; set; }
         public Ipv4Configuration? Ipv4 { get; set; }
         public bool AdminUp { get; set; }

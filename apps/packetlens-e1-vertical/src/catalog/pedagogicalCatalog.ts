@@ -27,7 +27,7 @@ export function explainEvent(event: PresentationEvent, previous: PresentationEve
       : ''
     return {
       summary: `${actor} actualiza su tabla CAM: ${event.table_delta.mac} → ${event.table_delta.port_interface_id}.`,
-      rationale: `Hecho del motor: delta mac_learned y protocolo del evento ethernet.${context}`,
+      rationale: `Hecho del motor: actualización de la tabla CAM mediante delta mac_learned y protocolo del evento ethernet.${context}`,
     }
   }
 

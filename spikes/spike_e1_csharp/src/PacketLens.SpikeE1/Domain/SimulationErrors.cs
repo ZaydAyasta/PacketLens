@@ -7,7 +7,8 @@ public enum SimulationErrorCode
     TimeOverflow,
     SequenceOverflow,
     EpochOverflow,
-    LinkInstanceOverflow
+    LinkInstanceOverflow,
+    EngineBusy
 }
 
 public sealed class SimulationException(SimulationErrorCode code) : Exception(code.ToString())

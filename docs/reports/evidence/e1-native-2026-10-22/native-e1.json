@@ -1,0 +1,48 @@
+{
+  "status": "passed",
+  "executable": "E:\\packetlens\\apps\\packetlens-e1-vertical\\src-tauri\\target\\debug\\packetlens-e1-vertical.exe",
+  "profile": "E:\\packetlens\\apps\\packetlens-e1-vertical\\src-tauri\\target\\webview2-e1-7neBEb",
+  "startedAt": "2026-10-22T14:20:41.409Z",
+  "url": "http://tauri.localhost/",
+  "schemaVersion": "presentation/v1",
+  "eventCount": 27,
+  "finalVirtualTimeNs": "8700",
+  "outcome": "Quiescent",
+  "source": "live_engine",
+  "nativeRejection": "Command packetlens_acceptance_unknown_command not found",
+  "sessionPreserved": true,
+  "recoveryPassed": true,
+  "calls": [
+    {
+      "command": "contract_version",
+      "sent": "contract_version",
+      "status": "fulfilled"
+    },
+    {
+      "command": "run_e1_s2_cold",
+      "sent": "run_e1_s2_cold",
+      "status": "fulfilled"
+    },
+    {
+      "command": "contract_version",
+      "sent": "contract_version",
+      "status": "fulfilled"
+    },
+    {
+      "command": "run_e1_s2_cold",
+      "sent": "packetlens_acceptance_unknown_command",
+      "status": "rejected"
+    },
+    {
+      "command": "contract_version",
+      "sent": "contract_version",
+      "status": "fulfilled"
+    },
+    {
+      "command": "run_e1_s2_cold",
+      "sent": "run_e1_s2_cold",
+      "status": "fulfilled"
+    }
+  ],
+  "finishedAt": "2026-10-22T14:20:51.389Z"
+}
